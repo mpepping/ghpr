@@ -12,10 +12,20 @@ import (
 )
 
 type fakeService struct {
-	merged  []string
-	closed  []string
-	reviews []string
-	fail    map[string]error
+	merged       []string
+	closed       []string
+	reviews      []string
+	diffRequests []string
+	diffs        map[string]string
+	fail         map[string]error
+}
+
+func (f *fakeService) Diff(_ context.Context, pr githubapi.PullRequest) (string, error) {
+	f.diffRequests = append(f.diffRequests, pr.Key())
+	if err := f.fail[pr.Key()]; err != nil {
+		return "", err
+	}
+	return f.diffs[pr.Key()], nil
 }
 
 func (f *fakeService) ApproveAndMerge(_ context.Context, pr githubapi.PullRequest) (githubapi.MergeOutcome, error) {
@@ -85,6 +95,79 @@ func TestFinishBatchRemovesSuccessAndKeepsFailure(t *testing.T) {
 	}
 }
 
+func TestDiffViewerLoadsHighlightedPullAndScrolls(t *testing.T) {
+	t.Parallel()
+
+	service := &fakeService{diffs: map[string]string{
+		"acme/two#2": strings.Join([]string{
+			"diff --git a/file.go b/file.go",
+			"--- a/file.go",
+			"+++ b/file.go",
+			"@@ -1,8 +1,8 @@",
+			"-old 1", "+new 1", " context 2", " context 3", " context 4",
+			" context 5", " context 6", " context 7", " context 8", " context 9",
+		}, "\n"),
+	}}
+	model := newTestModel(service)
+	model = updateModel(t, model, tea.WindowSizeMsg{Width: 80, Height: 8})
+	model = updateModel(t, model, key("down"))
+
+	updated, command := model.Update(key("d"))
+	model = updated.(Model)
+	if model.mode != modeDiffLoading || model.diffPR.Key() != "acme/two#2" || command == nil {
+		t.Fatalf("diff did not start for highlighted PR: mode=%v pr=%s command=%v", model.mode, model.diffPR.Key(), command)
+	}
+
+	message := model.loadDiff(context.Background(), model.diffPR)()
+	model = updateModel(t, model, message)
+	if model.mode != modeDiff {
+		t.Fatalf("mode = %v, want diff", model.mode)
+	}
+	if len(service.diffRequests) != 1 || service.diffRequests[0] != "acme/two#2" {
+		t.Fatalf("diff requests = %v", service.diffRequests)
+	}
+
+	model = updateModel(t, model, key(" "))
+	pageDownOffset := model.viewport.YOffset
+	if pageDownOffset == 0 {
+		t.Fatal("space did not page down in diff viewer")
+	}
+	model = updateModel(t, model, key("pgup"))
+	if model.viewport.YOffset >= pageDownOffset {
+		t.Fatal("Page Up did not scroll up in diff viewer")
+	}
+	model = updateModel(t, model, key("q"))
+	if model.mode != modeList {
+		t.Fatalf("q returned mode %v, want list", model.mode)
+	}
+}
+
+func TestOpenHighlightedPullRequestInBrowser(t *testing.T) {
+	t.Parallel()
+
+	model := newTestModel(&fakeService{})
+	var openedURL string
+	model.openURL = func(target string) error {
+		openedURL = target
+		return nil
+	}
+	model = updateModel(t, model, key("down"))
+
+	updated, command := model.Update(key("w"))
+	model = updated.(Model)
+	if command == nil || !strings.Contains(model.status, "Opening acme/two#2") {
+		t.Fatalf("browser action did not start: command=%v status=%q", command, model.status)
+	}
+
+	model = updateModel(t, model, command())
+	if openedURL != "https://example.test/2" {
+		t.Fatalf("opened URL = %q, want highlighted PR URL", openedURL)
+	}
+	if !strings.Contains(model.status, "Opened acme/two#2") {
+		t.Fatalf("status = %q, want success status", model.status)
+	}
+}
+
 func TestRequestChangesRequiresReason(t *testing.T) {
 	t.Parallel()
 
@@ -121,6 +204,8 @@ func key(value string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyEnter}
 	case "down":
 		return tea.KeyMsg{Type: tea.KeyDown}
+	case "pgup":
+		return tea.KeyMsg{Type: tea.KeyPgUp}
 	default:
 		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(value)}
 	}

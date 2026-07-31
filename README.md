@@ -6,6 +6,8 @@
 
 - Find open pull requests across all non-archived repositories owned by a GitHub account.
 - Select one or many pull requests in a terminal UI.
+- View the highlighted pull request's colorized diff in a built-in pager.
+- Open the highlighted pull request on GitHub in the default browser.
 - Approve and squash-merge selected pull requests.
   - `ghpr` first tries to enable GitHub auto-merge.
   - If auto-merge is unavailable, it attempts a direct squash merge.
@@ -99,6 +101,8 @@ ghpr --owner mpepping --limit 100
 | -------------------- | ----------------------------------------------- |
 | `↑` / `↓`, `j` / `k` | Navigate                                        |
 | `space`              | Select or deselect the current pull request     |
+| `d`                  | Open the highlighted pull request's diff        |
+| `w`                  | Open the highlighted pull request in a browser  |
 | `a`                  | Select or deselect all                          |
 | `m`                  | Approve and squash-merge selected pull requests |
 | `c`                  | Close selected pull requests                    |
@@ -106,6 +110,8 @@ ghpr --owner mpepping --limit 100
 | `y` / `enter`        | Confirm an action                               |
 | `n` / `esc`          | Cancel a prompt                                 |
 | `q`                  | Quit                                            |
+
+In the diff viewer, use `space` or `Page Down` to move one page down, `Page Up` to move one page up, and the arrow keys for line-by-line scrolling. Press `esc` or `q` to return to the pull request list.
 
 GitHub does not allow users to approve their own pull requests. Such an action is reported as a per-item failure and the pull request remains selected.
 

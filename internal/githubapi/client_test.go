@@ -106,6 +106,32 @@ func TestListOpenPullRequestsUsesOrganizationQualifier(t *testing.T) {
 	}
 }
 
+func TestDiff(t *testing.T) {
+	t.Parallel()
+
+	const want = "diff --git a/file.go b/file.go\n-old\n+new\n"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || request.URL.Path != "/repos/acme/widgets/pulls/10" {
+			http.NotFound(writer, request)
+			return
+		}
+		if got := request.Header.Get("Accept"); got != "application/vnd.github.v3.diff" {
+			t.Errorf("Accept header = %q, want diff media type", got)
+		}
+		writer.Header().Set("Content-Type", "text/plain")
+		_, _ = writer.Write([]byte(want))
+	}))
+	defer server.Close()
+
+	got, err := testClient(t, server).Diff(context.Background(), PullRequest{Owner: "acme", Repo: "widgets", Number: 10})
+	if err != nil {
+		t.Fatalf("Diff() error = %v", err)
+	}
+	if got != want {
+		t.Fatalf("Diff() = %q, want %q", got, want)
+	}
+}
+
 func TestApproveAndMergeEnablesAutoMerge(t *testing.T) {
 	t.Parallel()
 

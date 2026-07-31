@@ -7,14 +7,17 @@ import (
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/mpepping/ghpr/internal/browser"
 	"github.com/mpepping/ghpr/internal/githubapi"
 )
 
 // GitHubService is the part of the GitHub API used by the TUI.
 type GitHubService interface {
+	Diff(context.Context, githubapi.PullRequest) (string, error)
 	ApproveAndMerge(context.Context, githubapi.PullRequest) (githubapi.MergeOutcome, error)
 	RequestChanges(context.Context, githubapi.PullRequest, string) error
 	Close(context.Context, githubapi.PullRequest, string) error
@@ -27,6 +30,8 @@ const (
 	modeComment
 	modeConfirm
 	modeRunning
+	modeDiffLoading
+	modeDiff
 )
 
 type action int
@@ -49,14 +54,30 @@ type batchFinishedMsg struct {
 	results []actionResult
 }
 
+type diffLoadedMsg struct {
+	key     string
+	content string
+	err     error
+}
+
+type urlOpenedMsg struct {
+	key string
+	err error
+}
+
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
-	helpStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	cursorStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	statusStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-	draftStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
+	helpStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	selectedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	cursorStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	statusStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	draftStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	diffFileStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	diffHeaderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
+	diffAddStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	diffDeleteStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	diffMetaStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 )
 
 // Model is the ghpr Bubble Tea model.
@@ -70,13 +91,16 @@ type Model struct {
 	width    int
 	height   int
 
-	mode    mode
-	pending action
-	comment string
-	input   textinput.Model
-	spinner spinner.Model
-	cancel  context.CancelFunc
-	status  string
+	mode     mode
+	pending  action
+	comment  string
+	input    textinput.Model
+	spinner  spinner.Model
+	viewport viewport.Model
+	diffPR   githubapi.PullRequest
+	openURL  func(string) error
+	cancel   context.CancelFunc
+	status   string
 }
 
 // New creates a multi-select pull request model.
@@ -89,6 +113,9 @@ func New(ctx context.Context, service GitHubService, owner string, pulls []githu
 	activity.Spinner = spinner.Dot
 	activity.Style = statusStyle
 
+	diffViewport := viewport.New(80, 20)
+	diffViewport.SetHorizontalStep(8)
+
 	return Model{
 		ctx:      ctx,
 		service:  service,
@@ -97,6 +124,8 @@ func New(ctx context.Context, service GitHubService, owner string, pulls []githu
 		selected: make(map[string]bool),
 		input:    input,
 		spinner:  activity,
+		viewport: diffViewport,
+		openURL:  browser.Open,
 	}
 }
 
@@ -112,9 +141,20 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.input.Width = max(20, min(80, msg.Width-6))
+		m.viewport.Width = max(1, msg.Width)
+		m.viewport.Height = max(1, msg.Height-3)
 		return m, nil
 	case batchFinishedMsg:
 		return m.finishBatch(msg), nil
+	case diffLoadedMsg:
+		return m.finishDiff(msg), nil
+	case urlOpenedMsg:
+		if msg.err != nil {
+			m.status = "Unable to open " + msg.key + " in the default browser: " + msg.err.Error()
+		} else {
+			m.status = "Opened " + msg.key + " in the default browser."
+		}
+		return m, nil
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			if m.cancel != nil {
@@ -133,6 +173,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(message)
 		return m, cmd
+	case modeDiffLoading:
+		return m.updateDiffLoading(message)
+	case modeDiff:
+		return m.updateDiff(message)
 	default:
 		return m.updateList(message)
 	}
@@ -187,8 +231,105 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m.prepareAction(actionClose)
 	case "r":
 		return m.prepareAction(actionRequestChanges)
+	case "d":
+		return m.openDiff()
+	case "w":
+		return m.openHighlightedURL()
 	}
 	return m, nil
+}
+
+func (m Model) openHighlightedURL() (tea.Model, tea.Cmd) {
+	if len(m.pulls) == 0 {
+		return m, nil
+	}
+
+	pr := m.pulls[m.cursor]
+	m.status = "Opening " + pr.Key() + " in the default browser…"
+	return m, func() tea.Msg {
+		return urlOpenedMsg{key: pr.Key(), err: m.openURL(pr.URL)}
+	}
+}
+
+func (m Model) openDiff() (tea.Model, tea.Cmd) {
+	if len(m.pulls) == 0 {
+		return m, nil
+	}
+
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.cancel = cancel
+	m.diffPR = m.pulls[m.cursor]
+	m.mode = modeDiffLoading
+	m.status = ""
+	m.viewport.SetContent("")
+	m.viewport.GotoTop()
+	return m, tea.Batch(m.spinner.Tick, m.loadDiff(ctx, m.diffPR))
+}
+
+func (m Model) loadDiff(ctx context.Context, pr githubapi.PullRequest) tea.Cmd {
+	return func() tea.Msg {
+		content, err := m.service.Diff(ctx, pr)
+		return diffLoadedMsg{key: pr.Key(), content: content, err: err}
+	}
+}
+
+func (m Model) finishDiff(message diffLoadedMsg) Model {
+	if m.mode != modeDiffLoading || message.key != m.diffPR.Key() {
+		return m
+	}
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	if message.err != nil {
+		m.status = "Unable to load diff: " + message.err.Error()
+		m.mode = modeList
+		m.diffPR = githubapi.PullRequest{}
+		return m
+	}
+
+	content := message.content
+	if strings.TrimSpace(content) == "" {
+		content = "No changes in this pull request."
+	}
+	m.viewport.SetContent(highlightDiff(content))
+	m.viewport.GotoTop()
+	m.mode = modeDiff
+	return m
+}
+
+func (m Model) updateDiffLoading(message tea.Msg) (tea.Model, tea.Cmd) {
+	if msg, ok := message.(tea.KeyMsg); ok {
+		if msg.String() == "esc" || msg.String() == "q" {
+			return m.closeDiff(), nil
+		}
+	}
+	var cmd tea.Cmd
+	m.spinner, cmd = m.spinner.Update(message)
+	return m, cmd
+}
+
+func (m Model) updateDiff(message tea.Msg) (tea.Model, tea.Cmd) {
+	if msg, ok := message.(tea.KeyMsg); ok {
+		if msg.String() == "esc" || msg.String() == "q" {
+			return m.closeDiff(), nil
+		}
+	}
+	var cmd tea.Cmd
+	m.viewport, cmd = m.viewport.Update(message)
+	return m, cmd
+}
+
+func (m Model) closeDiff() Model {
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+	m.mode = modeList
+	m.diffPR = githubapi.PullRequest{}
+	m.viewport.SetContent("")
+	m.status = ""
+	return m
 }
 
 func (m Model) prepareAction(next action) (tea.Model, tea.Cmd) {
@@ -359,6 +500,13 @@ func (m Model) selectedPulls() []githubapi.PullRequest {
 
 // View implements tea.Model.
 func (m Model) View() string {
+	if m.mode == modeDiffLoading {
+		return m.renderDiffLoading()
+	}
+	if m.mode == modeDiff {
+		return m.renderDiff()
+	}
+
 	var view strings.Builder
 	fmt.Fprintf(&view, "%s  %s\n", titleStyle.Render("ghpr"), helpStyle.Render("owner: "+m.owner))
 	fmt.Fprintf(&view, "%d open pull request(s) · %d selected\n\n", len(m.pulls), len(m.selected))
@@ -396,19 +544,39 @@ func (m Model) View() string {
 	default:
 		if m.status != "" {
 			style := statusStyle
-			if strings.Contains(m.status, "failed") || strings.Contains(m.status, "required") {
+			if strings.Contains(m.status, "failed") || strings.Contains(m.status, "required") || strings.HasPrefix(m.status, "Unable") {
 				style = errorStyle
 			}
 			view.WriteString(style.Render(m.status))
 			view.WriteByte('\n')
 		}
-		view.WriteString(helpStyle.Render("↑/↓ navigate · space select · a all · m approve+merge · c close · r request changes · q quit"))
+		view.WriteString(helpStyle.Render("↑/↓ navigate · space select · d diff · w web · a all · m approve+merge · c close · r request changes · q quit"))
 		if len(m.pulls) > 0 {
 			view.WriteByte('\n')
 			view.WriteString(helpStyle.Render(m.pulls[m.cursor].URL))
 		}
 	}
 
+	return view.String()
+}
+
+func (m Model) renderDiffLoading() string {
+	var view strings.Builder
+	fmt.Fprintf(&view, "%s  %s\n", titleStyle.Render("ghpr diff"), m.diffPR.Key())
+	view.WriteString(truncate(m.diffPR.Title, max(20, m.width)))
+	view.WriteString("\n\n")
+	fmt.Fprintf(&view, "%s Loading diff…\n\n", m.spinner.View())
+	view.WriteString(helpStyle.Render("esc/q back · ctrl+c quit"))
+	return view.String()
+}
+
+func (m Model) renderDiff() string {
+	var view strings.Builder
+	fmt.Fprintf(&view, "%s  %s — %s\n", titleStyle.Render("ghpr diff"), m.diffPR.Key(), truncate(m.diffPR.Title, max(20, m.width-len(m.diffPR.Key())-15)))
+	view.WriteString(m.viewport.View())
+	view.WriteByte('\n')
+	progress := int(m.viewport.ScrollPercent()*100 + 0.5)
+	fmt.Fprintf(&view, "%s", helpStyle.Render(fmt.Sprintf("%3d%% · space/pgdn page down · pgup page up · ↑/↓ scroll · esc/q back", progress)))
 	return view.String()
 }
 
@@ -494,4 +662,33 @@ func padRight(value string, width int) string {
 		return value
 	}
 	return value + strings.Repeat(" ", padding)
+}
+
+func highlightDiff(content string) string {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	lines := strings.Split(content, "\n")
+	for index, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			lines[index] = diffFileStyle.Render(line)
+		case strings.HasPrefix(line, "@@"):
+			lines[index] = diffHeaderStyle.Render(line)
+		case strings.HasPrefix(line, "--- "), strings.HasPrefix(line, "+++ "):
+			lines[index] = diffHeaderStyle.Render(line)
+		case strings.HasPrefix(line, "+"):
+			lines[index] = diffAddStyle.Render(line)
+		case strings.HasPrefix(line, "-"):
+			lines[index] = diffDeleteStyle.Render(line)
+		case strings.HasPrefix(line, "index "),
+			strings.HasPrefix(line, "new file mode "),
+			strings.HasPrefix(line, "deleted file mode "),
+			strings.HasPrefix(line, "similarity index "),
+			strings.HasPrefix(line, "rename from "),
+			strings.HasPrefix(line, "rename to "),
+			strings.HasPrefix(line, "Binary files "),
+			strings.HasPrefix(line, "\\ No newline at end of file"):
+			lines[index] = diffMetaStyle.Render(line)
+		}
+	}
+	return strings.Join(lines, "\n")
 }
