@@ -6,6 +6,7 @@
 
 - Find open pull requests across all non-archived repositories owned by a GitHub account.
 - Select one or many pull requests in a terminal UI.
+- Show the CI / checks status for each pull request.
 - View the highlighted pull request's colorized diff in a built-in pager.
 - Open the highlighted pull request on GitHub in the default browser.
 - Approve and squash-merge selected pull requests.
@@ -16,7 +17,7 @@
 - Keep processing a batch when an individual pull request fails.
 
 > [!WARNING]
-> Merge and close are destructive actions. Take time to review.
+> Merge and close are destructive actions. Take time to review PR's.
 
 ## Installation
 

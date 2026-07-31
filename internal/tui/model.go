@@ -17,11 +17,14 @@ import (
 
 // GitHubService is the part of the GitHub API used by the TUI.
 type GitHubService interface {
+	BuildStatuses(context.Context, []githubapi.PullRequest) (map[string]githubapi.BuildStatus, error)
 	Diff(context.Context, githubapi.PullRequest) (string, error)
 	ApproveAndMerge(context.Context, githubapi.PullRequest) (githubapi.MergeOutcome, error)
 	RequestChanges(context.Context, githubapi.PullRequest, string) error
 	Close(context.Context, githubapi.PullRequest, string) error
 }
+
+const buildStatusBatchSize = 25
 
 type mode int
 
@@ -65,19 +68,29 @@ type urlOpenedMsg struct {
 	err error
 }
 
+type buildStatusesLoadedMsg struct {
+	keys     []string
+	statuses map[string]githubapi.BuildStatus
+	err      error
+}
+
 var (
-	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
-	helpStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	selectedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	cursorStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	statusStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-	draftStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	diffFileStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	diffHeaderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
-	diffAddStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	diffDeleteStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	diffMetaStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	titleStyle        = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
+	helpStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	selectedStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	cursorStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	errorStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	statusStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	draftStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	diffFileStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	diffHeaderStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
+	diffAddStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	diffDeleteStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	diffMetaStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	buildSuccessStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
+	buildPendingStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
+	buildFailureStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
+	buildUnknownStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
 )
 
 // Model is the ghpr Bubble Tea model.
@@ -91,20 +104,24 @@ type Model struct {
 	width    int
 	height   int
 
-	mode     mode
-	pending  action
-	comment  string
-	input    textinput.Model
-	spinner  spinner.Model
-	viewport viewport.Model
-	diffPR   githubapi.PullRequest
-	openURL  func(string) error
-	cancel   context.CancelFunc
-	status   string
+	mode             mode
+	pending          action
+	comment          string
+	input            textinput.Model
+	spinner          spinner.Model
+	viewport         viewport.Model
+	diffPR           githubapi.PullRequest
+	openURL          func(string) error
+	buildStatuses    map[string]githubapi.BuildStatus
+	buildStatusQueue []githubapi.PullRequest
+	buildStatusNext  int
+	cancel           context.CancelFunc
+	status           string
 }
 
 // New creates a multi-select pull request model.
 func New(ctx context.Context, service GitHubService, owner string, pulls []githubapi.PullRequest) Model {
+	pullList := append([]githubapi.PullRequest(nil), pulls...)
 	input := textinput.New()
 	input.CharLimit = 500
 	input.Width = 70
@@ -117,21 +134,23 @@ func New(ctx context.Context, service GitHubService, owner string, pulls []githu
 	diffViewport.SetHorizontalStep(8)
 
 	return Model{
-		ctx:      ctx,
-		service:  service,
-		owner:    owner,
-		pulls:    append([]githubapi.PullRequest(nil), pulls...),
-		selected: make(map[string]bool),
-		input:    input,
-		spinner:  activity,
-		viewport: diffViewport,
-		openURL:  browser.Open,
+		ctx:              ctx,
+		service:          service,
+		owner:            owner,
+		pulls:            pullList,
+		selected:         make(map[string]bool),
+		input:            input,
+		spinner:          activity,
+		viewport:         diffViewport,
+		openURL:          browser.Open,
+		buildStatuses:    make(map[string]githubapi.BuildStatus),
+		buildStatusQueue: append([]githubapi.PullRequest(nil), pullList...),
 	}
 }
 
 // Init implements tea.Model.
 func (m Model) Init() tea.Cmd {
-	return nil
+	return m.loadNextBuildStatusBatch()
 }
 
 // Update implements tea.Model.
@@ -155,6 +174,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "Opened " + msg.key + " in the default browser."
 		}
 		return m, nil
+	case buildStatusesLoadedMsg:
+		return m.finishBuildStatusBatch(msg)
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			if m.cancel != nil {
@@ -180,6 +201,38 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	default:
 		return m.updateList(message)
 	}
+}
+
+func (m Model) loadNextBuildStatusBatch() tea.Cmd {
+	if m.buildStatusNext >= len(m.buildStatusQueue) {
+		return nil
+	}
+	end := min(len(m.buildStatusQueue), m.buildStatusNext+buildStatusBatchSize)
+	batch := append([]githubapi.PullRequest(nil), m.buildStatusQueue[m.buildStatusNext:end]...)
+	return func() tea.Msg {
+		statuses, err := m.service.BuildStatuses(m.ctx, batch)
+		keys := make([]string, 0, len(batch))
+		for _, pr := range batch {
+			keys = append(keys, pr.Key())
+		}
+		return buildStatusesLoadedMsg{keys: keys, statuses: statuses, err: err}
+	}
+}
+
+func (m Model) finishBuildStatusBatch(message buildStatusesLoadedMsg) (tea.Model, tea.Cmd) {
+	for _, key := range message.keys {
+		if message.err != nil {
+			m.buildStatuses[key] = githubapi.BuildStatusUnknown
+			continue
+		}
+		status, ok := message.statuses[key]
+		if !ok {
+			status = githubapi.BuildStatusNone
+		}
+		m.buildStatuses[key] = status
+	}
+	m.buildStatusNext += len(message.keys)
+	return m, m.loadNextBuildStatusBatch()
 }
 
 func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -514,6 +567,8 @@ func (m Model) View() string {
 	if len(m.pulls) == 0 {
 		view.WriteString("No open pull requests remain.\n")
 	} else {
+		view.WriteString(m.renderListHeader())
+		view.WriteByte('\n')
 		start, end := m.visibleRange()
 		for index := start; index < end; index++ {
 			view.WriteString(m.renderRow(index))
@@ -553,7 +608,8 @@ func (m Model) View() string {
 		view.WriteString(helpStyle.Render("↑/↓ navigate · space select · d diff · w web · a all · m approve+merge · c close · r request changes · q quit"))
 		if len(m.pulls) > 0 {
 			view.WriteByte('\n')
-			view.WriteString(helpStyle.Render(m.pulls[m.cursor].URL))
+			current := m.pulls[m.cursor]
+			view.WriteString(helpStyle.Render(fmt.Sprintf("CI: %s · %s", m.buildStatusLabel(current), current.URL)))
 		}
 	}
 
@@ -580,6 +636,12 @@ func (m Model) renderDiff() string {
 	return view.String()
 }
 
+func (m Model) renderListHeader() string {
+	repositoryWidth := m.repositoryColumnWidth()
+	header := fmt.Sprintf("      %s %s %s %s", padRight("REPOSITORY", repositoryWidth), padRight("PR", 7), "CI", "TITLE")
+	return helpStyle.Render(header)
+}
+
 func (m Model) renderRow(index int) string {
 	pr := m.pulls[index]
 	cursor := "  "
@@ -591,12 +653,10 @@ func (m Model) renderRow(index int) string {
 		checkbox = selectedStyle.Render("[x]")
 	}
 
-	repositoryWidth := 26
-	if m.width > 0 && m.width < 80 {
-		repositoryWidth = 18
-	}
+	repositoryWidth := m.repositoryColumnWidth()
 	repository := padRight(truncate(pr.Repository(), repositoryWidth), repositoryWidth)
-	prefix := fmt.Sprintf("%s%s %s #%d", cursor, checkbox, repository, pr.Number)
+	number := padRight(fmt.Sprintf("#%d", pr.Number), 7)
+	prefix := fmt.Sprintf("%s%s %s %s %s", cursor, checkbox, repository, number, m.renderBuildStatus(pr))
 	extra := ""
 	if pr.Draft {
 		extra = " " + draftStyle.Render("DRAFT")
@@ -606,6 +666,40 @@ func (m Model) renderRow(index int) string {
 		titleWidth = max(15, m.width-lipgloss.Width(prefix)-lipgloss.Width(extra)-2)
 	}
 	return fmt.Sprintf("%s %s%s", prefix, truncate(pr.Title, titleWidth), extra)
+}
+
+func (m Model) repositoryColumnWidth() int {
+	if m.width > 0 && m.width < 80 {
+		return 18
+	}
+	return 26
+}
+
+func (m Model) renderBuildStatus(pr githubapi.PullRequest) string {
+	status, loaded := m.buildStatuses[pr.Key()]
+	if !loaded {
+		return padRight(helpStyle.Render("·"), 2)
+	}
+	switch status {
+	case githubapi.BuildStatusSuccess:
+		return padRight(buildSuccessStyle.Render("✓"), 2)
+	case githubapi.BuildStatusPending:
+		return padRight(buildPendingStyle.Render("…"), 2)
+	case githubapi.BuildStatusFailure:
+		return padRight(buildFailureStyle.Render("✗"), 2)
+	case githubapi.BuildStatusUnknown:
+		return padRight(buildUnknownStyle.Render("?"), 2)
+	default:
+		return padRight(helpStyle.Render("–"), 2)
+	}
+}
+
+func (m Model) buildStatusLabel(pr githubapi.PullRequest) string {
+	status, loaded := m.buildStatuses[pr.Key()]
+	if !loaded {
+		return "loading"
+	}
+	return string(status)
 }
 
 func (m Model) renderConfirmation() string {
@@ -639,7 +733,7 @@ func (m Model) pageSize() int {
 	if m.height <= 0 {
 		return 15
 	}
-	return max(3, m.height-9)
+	return max(3, m.height-10)
 }
 
 func truncate(value string, width int) string {

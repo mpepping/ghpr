@@ -12,12 +12,25 @@ import (
 )
 
 type fakeService struct {
-	merged       []string
-	closed       []string
-	reviews      []string
-	diffRequests []string
-	diffs        map[string]string
-	fail         map[string]error
+	merged        []string
+	closed        []string
+	reviews       []string
+	diffRequests  []string
+	diffs         map[string]string
+	buildStatuses map[string]githubapi.BuildStatus
+	fail          map[string]error
+}
+
+func (f *fakeService) BuildStatuses(_ context.Context, pulls []githubapi.PullRequest) (map[string]githubapi.BuildStatus, error) {
+	result := make(map[string]githubapi.BuildStatus, len(pulls))
+	for _, pr := range pulls {
+		if status, ok := f.buildStatuses[pr.Key()]; ok {
+			result[pr.Key()] = status
+		} else {
+			result[pr.Key()] = githubapi.BuildStatusNone
+		}
+	}
+	return result, nil
 }
 
 func (f *fakeService) Diff(_ context.Context, pr githubapi.PullRequest) (string, error) {
@@ -165,6 +178,46 @@ func TestOpenHighlightedPullRequestInBrowser(t *testing.T) {
 	}
 	if !strings.Contains(model.status, "Opened acme/two#2") {
 		t.Fatalf("status = %q, want success status", model.status)
+	}
+}
+
+func TestBuildStatusColumnLoadsAsynchronously(t *testing.T) {
+	t.Parallel()
+
+	service := &fakeService{buildStatuses: map[string]githubapi.BuildStatus{
+		"acme/one#1": githubapi.BuildStatusSuccess,
+		"acme/two#2": githubapi.BuildStatusFailure,
+	}}
+	model := newTestModel(service)
+
+	// Init should return a command to load the first batch.
+	command := model.Init()
+	if command == nil {
+		t.Fatal("Init() returned nil, want build status loader")
+	}
+
+	// Execute the command and feed the result back.
+	model = updateModel(t, model, command())
+
+	if got := model.buildStatuses["acme/one#1"]; got != githubapi.BuildStatusSuccess {
+		t.Fatalf("build status for one#1 = %q, want success", got)
+	}
+	if got := model.buildStatuses["acme/two#2"]; got != githubapi.BuildStatusFailure {
+		t.Fatalf("build status for two#2 = %q, want failure", got)
+	}
+
+	// View should contain the status icons.
+	view := model.View()
+	if !strings.Contains(view, "✓") {
+		t.Fatal("view should contain success icon ✓")
+	}
+	if !strings.Contains(view, "✗") {
+		t.Fatal("view should contain failure icon ✗")
+	}
+
+	// Footer should show the label for the highlighted PR.
+	if !strings.Contains(view, "CI: success") {
+		t.Fatalf("footer should contain CI label, got:\n%s", view)
 	}
 }
 

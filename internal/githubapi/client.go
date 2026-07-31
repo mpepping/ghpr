@@ -12,7 +12,10 @@ import (
 	"github.com/google/go-github/v81/github"
 )
 
-const maxSearchResults = 1000
+const (
+	maxSearchResults    = 1000
+	maxBuildStatusBatch = 50
+)
 
 var ownerPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`)
 
@@ -37,6 +40,18 @@ func (p PullRequest) Key() string {
 func (p PullRequest) Repository() string {
 	return p.Owner + "/" + p.Repo
 }
+
+// BuildStatus is the aggregate state of the checks and commit statuses for a
+// pull request's latest commit.
+type BuildStatus string
+
+const (
+	BuildStatusNone    BuildStatus = "none"
+	BuildStatusPending BuildStatus = "pending"
+	BuildStatusSuccess BuildStatus = "success"
+	BuildStatusFailure BuildStatus = "failure"
+	BuildStatusUnknown BuildStatus = "unknown"
+)
 
 // MergeOutcome describes what GitHub did after an approve-and-merge action.
 type MergeOutcome string
@@ -156,6 +171,91 @@ func (c *Client) Diff(ctx context.Context, pr PullRequest) (string, error) {
 		return "", fmt.Errorf("get diff for %s: %w", pr.Key(), err)
 	}
 	return diff, nil
+}
+
+// BuildStatuses returns the aggregate status-check rollup for each pull
+// request's latest commit. Requests are deliberately bounded so callers can
+// load large lists in rate-friendly batches.
+func (c *Client) BuildStatuses(ctx context.Context, pulls []PullRequest) (map[string]BuildStatus, error) {
+	if len(pulls) == 0 {
+		return map[string]BuildStatus{}, nil
+	}
+	if len(pulls) > maxBuildStatusBatch {
+		return nil, fmt.Errorf("build status batch contains %d pull requests; maximum is %d", len(pulls), maxBuildStatusBatch)
+	}
+
+	declarations := make([]string, 0, len(pulls))
+	selections := make([]string, 0, len(pulls))
+	variables := make(map[string]any, len(pulls))
+	statuses := make(map[string]BuildStatus, len(pulls))
+	for index, pr := range pulls {
+		variable := fmt.Sprintf("url%d", index)
+		alias := fmt.Sprintf("pr%d", index)
+		declarations = append(declarations, "$"+variable+": URI!")
+		selections = append(selections, fmt.Sprintf(`%s: resource(url: $%s) {
+  ... on PullRequest {
+    commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+  }
+}`, alias, variable))
+		variables[variable] = pr.URL
+		statuses[pr.Key()] = BuildStatusNone
+	}
+
+	requestBody := graphQLRequest{
+		Query:     fmt.Sprintf("query BuildStatuses(%s) {\n%s\n}", strings.Join(declarations, ", "), strings.Join(selections, "\n")),
+		Variables: variables,
+	}
+	request, err := c.github.NewRequest("POST", "graphql", requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("create build status GraphQL request: %w", err)
+	}
+
+	var response buildStatusesGraphQLResponse
+	if _, err := c.github.Do(ctx, request, &response); err != nil {
+		return nil, fmt.Errorf("get pull request build statuses: %w", err)
+	}
+	if len(response.Errors) > 0 {
+		messages := make([]string, 0, len(response.Errors))
+		for _, graphQLError := range response.Errors {
+			messages = append(messages, graphQLError.Message)
+		}
+		return nil, fmt.Errorf("get pull request build statuses: %s", strings.Join(messages, "; "))
+	}
+
+	for index, pr := range pulls {
+		resource := response.Data[fmt.Sprintf("pr%d", index)]
+		if len(resource.Commits.Nodes) == 0 || resource.Commits.Nodes[0].Commit.StatusCheckRollup == nil {
+			continue
+		}
+		switch strings.ToUpper(resource.Commits.Nodes[0].Commit.StatusCheckRollup.State) {
+		case "SUCCESS":
+			statuses[pr.Key()] = BuildStatusSuccess
+		case "PENDING", "EXPECTED":
+			statuses[pr.Key()] = BuildStatusPending
+		case "FAILURE", "ERROR":
+			statuses[pr.Key()] = BuildStatusFailure
+		default:
+			statuses[pr.Key()] = BuildStatusUnknown
+		}
+	}
+	return statuses, nil
+}
+
+type buildStatusesGraphQLResponse struct {
+	Data map[string]struct {
+		Commits struct {
+			Nodes []struct {
+				Commit struct {
+					StatusCheckRollup *struct {
+						State string `json:"state"`
+					} `json:"statusCheckRollup"`
+				} `json:"commit"`
+			} `json:"nodes"`
+		} `json:"commits"`
+	} `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
 }
 
 // ApproveAndMerge approves a pull request, then tries to enable squash
