@@ -132,6 +132,62 @@ func TestDiff(t *testing.T) {
 	}
 }
 
+func TestBuildStatuses(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != "/graphql" {
+			http.NotFound(writer, request)
+			return
+		}
+		var body graphQLRequest
+		decodeJSON(t, request, &body)
+		if !strings.Contains(body.Query, "statusCheckRollup") || !strings.Contains(body.Query, "commits(last: 1)") {
+			t.Errorf("unexpected build status query: %q", body.Query)
+		}
+		if got := body.Variables["url1"]; got != "https://github.com/acme/widgets/pull/2" {
+			t.Errorf("url1 variable = %v", got)
+		}
+		writeJSON(t, writer, map[string]any{"data": map[string]any{
+			"pr0": map[string]any{"commits": map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"statusCheckRollup": map[string]any{"state": "SUCCESS"}}}}}},
+			"pr1": map[string]any{"commits": map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"statusCheckRollup": map[string]any{"state": "PENDING"}}}}}},
+			"pr2": map[string]any{"commits": map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"statusCheckRollup": map[string]any{"state": "ERROR"}}}}}},
+			"pr3": map[string]any{"commits": map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"statusCheckRollup": nil}}}}},
+		}})
+	}))
+	defer server.Close()
+
+	pulls := make([]PullRequest, 4)
+	for index := range pulls {
+		pulls[index] = PullRequest{
+			Owner:  "acme",
+			Repo:   "widgets",
+			Number: index + 1,
+			URL:    fmt.Sprintf("https://github.com/acme/widgets/pull/%d", index+1),
+		}
+	}
+	statuses, err := testClient(t, server).BuildStatuses(context.Background(), pulls)
+	if err != nil {
+		t.Fatalf("BuildStatuses() error = %v", err)
+	}
+	want := []BuildStatus{BuildStatusSuccess, BuildStatusPending, BuildStatusFailure, BuildStatusNone}
+	for index, pr := range pulls {
+		if got := statuses[pr.Key()]; got != want[index] {
+			t.Errorf("status for %s = %q, want %q", pr.Key(), got, want[index])
+		}
+	}
+}
+
+func TestBuildStatusesRejectsOversizedBatch(t *testing.T) {
+	t.Parallel()
+
+	pulls := make([]PullRequest, maxBuildStatusBatch+1)
+	_, err := NewClientWithGitHub(github.NewClient(nil)).BuildStatuses(context.Background(), pulls)
+	if err == nil || !strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("BuildStatuses() error = %v, want batch limit error", err)
+	}
+}
+
 func TestApproveAndMergeEnablesAutoMerge(t *testing.T) {
 	t.Parallel()
 
