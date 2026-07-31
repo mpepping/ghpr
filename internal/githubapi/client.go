@@ -149,6 +149,15 @@ func (c *Client) ownerQualifier(ctx context.Context, owner string) (string, erro
 	return "user", nil
 }
 
+// Diff returns a pull request's unified diff.
+func (c *Client) Diff(ctx context.Context, pr PullRequest) (string, error) {
+	diff, _, err := c.github.PullRequests.GetRaw(ctx, pr.Owner, pr.Repo, pr.Number, github.RawOptions{Type: github.Diff})
+	if err != nil {
+		return "", fmt.Errorf("get diff for %s: %w", pr.Key(), err)
+	}
+	return diff, nil
+}
+
 // ApproveAndMerge approves a pull request, then tries to enable squash
 // auto-merge. If auto-merge is unavailable, it falls back to a direct squash
 // merge, matching the behavior of the reference shell script.
