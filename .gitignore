@@ -1,0 +1,9 @@
+# Build output
+/ghpr
+/ghpr-*
+/dist/
+
+# Local files
+.DS_Store
+*.out
+coverage.txt

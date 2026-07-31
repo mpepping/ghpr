@@ -1,0 +1,268 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: make test
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Check code formatting
+        run: |
+          if [ -n "$(gofmt -s -l .)" ]; then
+            echo "Go code is not formatted:"
+            gofmt -s -d .
+            exit 1
+          fi
+
+  build:
+    name: Build
+    needs: [test, lint]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+            brew: true
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+            brew: true
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+            brew: true
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+            brew: true
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            suffix: windows-amd64.exe
+          - os: windows-latest
+            goos: windows
+            goarch: arm64
+            suffix: windows-arm64.exe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          {
+            echo "version=$VERSION"
+            echo "commit=$COMMIT"
+            echo "date=$DATE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build \
+            -buildvcs=false \
+            -ldflags "-s -w \
+              -X github.com/mpepping/ghpr/internal/cmd.version=${{ steps.version.outputs.version }} \
+              -X github.com/mpepping/ghpr/internal/cmd.commit=${{ steps.version.outputs.commit }} \
+              -X github.com/mpepping/ghpr/internal/cmd.date=${{ steps.version.outputs.date }}" \
+            -o ghpr-${{ matrix.suffix }} \
+            ./cmd/ghpr
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghpr-${{ matrix.suffix }}
+          path: ghpr-${{ matrix.suffix }}
+          retention-days: 30
+
+      - name: Package tarball for Homebrew
+        if: matrix.brew == true
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp ghpr-${{ matrix.suffix }} dist/ghpr
+          cp README.md dist/ 2>/dev/null || true
+          cp LICENSE dist/ 2>/dev/null || true
+          tar -czf ghpr-${{ matrix.suffix }}.tar.gz -C dist .
+
+      - name: Upload tarball artifact
+        if: matrix.brew == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghpr-${{ matrix.suffix }}-tarball
+          path: ghpr-${{ matrix.suffix }}.tar.gz
+          retention-days: 30
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          cd release
+          ls -lah
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Render formula
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          BASE="https://github.com/mpepping/ghpr/releases/download/${TAG}"
+
+          declare -A SHAS
+          for suf in darwin-amd64 darwin-arm64 linux-amd64 linux-arm64; do
+            curl -fsSL -o "ghpr-${suf}.tar.gz" "${BASE}/ghpr-${suf}.tar.gz"
+            SHAS[$suf]=$(sha256sum "ghpr-${suf}.tar.gz" | awk '{print $1}')
+          done
+
+          cat > ghpr.rb <<EOF
+          class Ghpr < Formula
+            desc "Manage GitHub pull requests from a multi-select terminal UI"
+            homepage "https://github.com/mpepping/ghpr"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${BASE}/ghpr-darwin-arm64.tar.gz"
+                sha256 "${SHAS[darwin-arm64]}"
+              end
+              on_intel do
+                url "${BASE}/ghpr-darwin-amd64.tar.gz"
+                sha256 "${SHAS[darwin-amd64]}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${BASE}/ghpr-linux-arm64.tar.gz"
+                sha256 "${SHAS[linux-arm64]}"
+              end
+              on_intel do
+                url "${BASE}/ghpr-linux-amd64.tar.gz"
+                sha256 "${SHAS[linux-amd64]}"
+              end
+            end
+
+            def install
+              bin.install "ghpr"
+            end
+
+            test do
+              assert_match "ghpr", shell_output("#{bin}/ghpr --help")
+            end
+          end
+          EOF
+
+          cat ghpr.rb
+
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: mpepping/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Commit and push formula
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p tap/Formula
+          mv ghpr.rb tap/Formula/ghpr.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ghpr.rb
+          if git diff --cached --quiet; then
+            echo "No formula changes to commit."
+            exit 0
+          fi
+          git commit -m "ghpr ${TAG}"
+          git push

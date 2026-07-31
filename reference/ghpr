@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+
+#!/bin/bash
+
+# Get all open PRs in repositories owned by you
+gh search prs --owner mpepping --state open --json number,title,repository,url --jq '.[] | "\(.number)|\(.title)|\(.repository.nameWithOwner)|\(.url)"' | while IFS='|' read -r pr_number pr_title repo_name pr_url; do
+  echo "=========================================="
+  echo "Repo: $repo_name"
+  echo "PR #$pr_number: $pr_title"
+  echo "URL: $pr_url"
+  echo "=========================================="
+
+  # Prompt for confirmation - redirect from /dev/tty to read user input
+  read -p "Action for this PR? (y)es/approve, (n)o/reject, (c)lose, (s)kip: " -n 1 -r REPLY </dev/tty
+  echo
+
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    # Approve the PR
+    if gh pr review "$pr_number" --repo "$repo_name" --approve; then
+      echo "✓ Approved PR #$pr_number"
+
+      # Merge the PR (using squash merge by default).
+      # Try auto-merge first; if the repo doesn't allow it, fall back to a direct merge.
+      if gh pr merge "$pr_number" --repo "$repo_name" --squash --auto 2>/dev/null; then
+        echo "✓ Merged PR #$pr_number"
+      elif gh pr merge "$pr_number" --repo "$repo_name" --squash; then
+        echo "✓ Merged PR #$pr_number"
+      else
+        echo "✗ Failed to merge PR #$pr_number"
+      fi
+    else
+      echo "✗ Failed to approve PR #$pr_number"
+    fi
+  elif [[ $REPLY =~ ^[Nn]$ ]]; then
+    # Request changes - prompt for comment
+    read -p "Enter reason for requesting changes: " -r COMMENT </dev/tty
+    if gh pr review "$pr_number" --repo "$repo_name" --request-changes --body "$COMMENT"; then
+      echo "✓ Requested changes on PR #$pr_number"
+    else
+      echo "✗ Failed to request changes on PR #$pr_number"
+    fi
+  elif [[ $REPLY =~ ^[Cc]$ ]]; then
+    # Close the PR without merging
+    read -p "Enter reason for closing (optional): " -r COMMENT </dev/tty
+    if [ -n "$COMMENT" ]; then
+      gh pr comment "$pr_number" --repo "$repo_name" --body "$COMMENT"
+    fi
+    if gh pr close "$pr_number" --repo "$repo_name"; then
+      echo "✓ Closed PR #$pr_number"
+    else
+      echo "✗ Failed to close PR #$pr_number"
+    fi
+  else
+    echo "⊘ Skipped PR #$pr_number"
+  fi
+
+  echo ""
+done
