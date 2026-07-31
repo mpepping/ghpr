@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/mpepping/ghpr/internal/browser"
 	"github.com/mpepping/ghpr/internal/githubapi"
 )
 
@@ -59,6 +60,11 @@ type diffLoadedMsg struct {
 	err     error
 }
 
+type urlOpenedMsg struct {
+	key string
+	err error
+}
+
 var (
 	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
 	helpStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
@@ -92,6 +98,7 @@ type Model struct {
 	spinner  spinner.Model
 	viewport viewport.Model
 	diffPR   githubapi.PullRequest
+	openURL  func(string) error
 	cancel   context.CancelFunc
 	status   string
 }
@@ -118,6 +125,7 @@ func New(ctx context.Context, service GitHubService, owner string, pulls []githu
 		input:    input,
 		spinner:  activity,
 		viewport: diffViewport,
+		openURL:  browser.Open,
 	}
 }
 
@@ -140,6 +148,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m.finishBatch(msg), nil
 	case diffLoadedMsg:
 		return m.finishDiff(msg), nil
+	case urlOpenedMsg:
+		if msg.err != nil {
+			m.status = "Unable to open " + msg.key + " in the default browser: " + msg.err.Error()
+		} else {
+			m.status = "Opened " + msg.key + " in the default browser."
+		}
+		return m, nil
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			if m.cancel != nil {
@@ -218,8 +233,22 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m.prepareAction(actionRequestChanges)
 	case "d":
 		return m.openDiff()
+	case "w":
+		return m.openHighlightedURL()
 	}
 	return m, nil
+}
+
+func (m Model) openHighlightedURL() (tea.Model, tea.Cmd) {
+	if len(m.pulls) == 0 {
+		return m, nil
+	}
+
+	pr := m.pulls[m.cursor]
+	m.status = "Opening " + pr.Key() + " in the default browser…"
+	return m, func() tea.Msg {
+		return urlOpenedMsg{key: pr.Key(), err: m.openURL(pr.URL)}
+	}
 }
 
 func (m Model) openDiff() (tea.Model, tea.Cmd) {
@@ -521,7 +550,7 @@ func (m Model) View() string {
 			view.WriteString(style.Render(m.status))
 			view.WriteByte('\n')
 		}
-		view.WriteString(helpStyle.Render("↑/↓ navigate · space select · d diff · a all · m approve+merge · c close · r request changes · q quit"))
+		view.WriteString(helpStyle.Render("↑/↓ navigate · space select · d diff · w web · a all · m approve+merge · c close · r request changes · q quit"))
 		if len(m.pulls) > 0 {
 			view.WriteByte('\n')
 			view.WriteString(helpStyle.Render(m.pulls[m.cursor].URL))

@@ -142,6 +142,32 @@ func TestDiffViewerLoadsHighlightedPullAndScrolls(t *testing.T) {
 	}
 }
 
+func TestOpenHighlightedPullRequestInBrowser(t *testing.T) {
+	t.Parallel()
+
+	model := newTestModel(&fakeService{})
+	var openedURL string
+	model.openURL = func(target string) error {
+		openedURL = target
+		return nil
+	}
+	model = updateModel(t, model, key("down"))
+
+	updated, command := model.Update(key("w"))
+	model = updated.(Model)
+	if command == nil || !strings.Contains(model.status, "Opening acme/two#2") {
+		t.Fatalf("browser action did not start: command=%v status=%q", command, model.status)
+	}
+
+	model = updateModel(t, model, command())
+	if openedURL != "https://example.test/2" {
+		t.Fatalf("opened URL = %q, want highlighted PR URL", openedURL)
+	}
+	if !strings.Contains(model.status, "Opened acme/two#2") {
+		t.Fatalf("status = %q, want success status", model.status)
+	}
+}
+
 func TestRequestChangesRequiresReason(t *testing.T) {
 	t.Parallel()
 
