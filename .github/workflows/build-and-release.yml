@@ -124,7 +124,7 @@ jobs:
             ./cmd/ghpr
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ghpr-${{ matrix.suffix }}
           path: ghpr-${{ matrix.suffix }}
@@ -142,7 +142,7 @@ jobs:
 
       - name: Upload tarball artifact
         if: matrix.brew == true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ghpr-${{ matrix.suffix }}-tarball
           path: ghpr-${{ matrix.suffix }}.tar.gz
