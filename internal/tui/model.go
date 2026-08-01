@@ -180,6 +180,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			if m.cancel != nil {
 				m.cancel()
+				m.cancel = nil
 			}
 			return m, tea.Quit
 		}

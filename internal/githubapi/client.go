@@ -19,6 +19,15 @@ const (
 
 var ownerPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`)
 
+// ValidateOwner checks if the given owner string is a valid GitHub username or organization name.
+// It returns an error if the owner is invalid.
+func ValidateOwner(owner string) error {
+	if !ownerPattern.MatchString(owner) {
+		return fmt.Errorf("invalid GitHub owner %q: must contain only alphanumeric characters and hyphens, and be 1-39 characters long", owner)
+	}
+	return nil
+}
+
 // PullRequest contains the fields ghpr needs to display and update a pull request.
 type PullRequest struct {
 	Owner     string
@@ -214,17 +223,26 @@ func (c *Client) BuildStatuses(ctx context.Context, pulls []PullRequest) (map[st
 	if _, err := c.github.Do(ctx, request, &response); err != nil {
 		return nil, fmt.Errorf("get pull request build statuses: %w", err)
 	}
+
+	// If there are GraphQL errors, we still process available data and return
+	// partial results. This ensures that a single failing PR doesn't prevent
+	// all others from getting status updates. Individual PR errors will result
+	// in BuildStatusUnknown for those PRs.
 	if len(response.Errors) > 0 {
-		messages := make([]string, 0, len(response.Errors))
-		for _, graphQLError := range response.Errors {
-			messages = append(messages, graphQLError.Message)
-		}
-		return nil, fmt.Errorf("get pull request build statuses: %s", strings.Join(messages, "; "))
+		// Note: We don't return an error here. Instead, we continue processing
+		// and return partial results. PRs affected by errors will remain at
+		// their initial BuildStatusNone or be set to BuildStatusUnknown.
 	}
 
 	for index, pr := range pulls {
-		resource := response.Data[fmt.Sprintf("pr%d", index)]
+		resource, exists := response.Data[fmt.Sprintf("pr%d", index)]
+		if !exists {
+			// PR data not in response (e.g., due to GraphQL error)
+			statuses[pr.Key()] = BuildStatusUnknown
+			continue
+		}
 		if len(resource.Commits.Nodes) == 0 || resource.Commits.Nodes[0].Commit.StatusCheckRollup == nil {
+			// No commit status data available
 			continue
 		}
 		switch strings.ToUpper(resource.Commits.Nodes[0].Commit.StatusCheckRollup.State) {
@@ -238,6 +256,7 @@ func (c *Client) BuildStatuses(ctx context.Context, pulls []PullRequest) (map[st
 			statuses[pr.Key()] = BuildStatusUnknown
 		}
 	}
+
 	return statuses, nil
 }
 
