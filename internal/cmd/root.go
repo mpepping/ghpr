@@ -67,7 +67,13 @@ func ExecuteArgs(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return nil
 	}
 	if *limit < 1 || *limit > 1000 {
-		return errors.New("--limit must be between 1 and 1000")
+		return fmt.Errorf("--limit must be between 1 and 1000 (got %d)", *limit)
+	}
+
+	if *owner != "" {
+		if err := githubapi.ValidateOwner(*owner); err != nil {
+			return err
+		}
 	}
 
 	token, err := auth.Token()
