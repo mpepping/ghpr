@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-github/v81/github"
@@ -73,6 +74,9 @@ const (
 // Client performs the GitHub operations used by ghpr.
 type Client struct {
 	github *github.Client
+
+	viewerMu    sync.Mutex
+	viewerLogin string
 }
 
 // NewClient creates an authenticated client for github.com.
@@ -95,7 +99,36 @@ func (c *Client) CurrentOwner(ctx context.Context) (string, error) {
 	if user.GetLogin() == "" {
 		return "", errors.New("GitHub returned an authenticated user without a login")
 	}
+	c.viewerMu.Lock()
+	c.viewerLogin = user.GetLogin()
+	c.viewerMu.Unlock()
 	return user.GetLogin(), nil
+}
+
+// viewer returns the authenticated login, caching it after the first lookup.
+func (c *Client) viewer(ctx context.Context) (string, error) {
+	c.viewerMu.Lock()
+	login := c.viewerLogin
+	c.viewerMu.Unlock()
+	if login != "" {
+		return login, nil
+	}
+	return c.CurrentOwner(ctx)
+}
+
+// authoredByViewer reports whether the authenticated user opened the pull
+// request. GitHub rejects self-reviews with 422 Unprocessable Entity, so those
+// review requests must be skipped. Lookup failures are treated as "not the
+// viewer" so the regular API call still runs and reports the real error.
+func (c *Client) authoredByViewer(ctx context.Context, pr PullRequest) bool {
+	if pr.Author == "" {
+		return false
+	}
+	login, err := c.viewer(ctx)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(login, pr.Author)
 }
 
 // ListOpenPullRequests finds open pull requests in repositories owned by owner.
@@ -280,12 +313,17 @@ type buildStatusesGraphQLResponse struct {
 // ApproveAndMerge approves a pull request, then tries to enable squash
 // auto-merge. If auto-merge is unavailable, it falls back to a direct squash
 // merge, matching the behavior of the reference shell script.
+//
+// Pull requests opened by the authenticated user are merged without an
+// approving review, because GitHub does not allow approving your own work.
 func (c *Client) ApproveAndMerge(ctx context.Context, pr PullRequest) (MergeOutcome, error) {
-	_, _, err := c.github.PullRequests.CreateReview(ctx, pr.Owner, pr.Repo, pr.Number, &github.PullRequestReviewRequest{
-		Event: github.Ptr("APPROVE"),
-	})
-	if err != nil {
-		return "", fmt.Errorf("approve %s: %w", pr.Key(), err)
+	if !c.authoredByViewer(ctx, pr) {
+		_, _, err := c.github.PullRequests.CreateReview(ctx, pr.Owner, pr.Repo, pr.Number, &github.PullRequestReviewRequest{
+			Event: github.Ptr("APPROVE"),
+		})
+		if err != nil {
+			return "", fmt.Errorf("approve %s: %w", pr.Key(), err)
+		}
 	}
 
 	autoOutcome, autoErr := c.enableAutoMerge(ctx, pr)
@@ -310,6 +348,9 @@ func (c *Client) RequestChanges(ctx context.Context, pr PullRequest, body string
 	body = strings.TrimSpace(body)
 	if body == "" {
 		return errors.New("a reason is required when requesting changes")
+	}
+	if c.authoredByViewer(ctx, pr) {
+		return fmt.Errorf("request changes on %s: GitHub does not allow reviewing your own pull request", pr.Key())
 	}
 	_, _, err := c.github.PullRequests.CreateReview(ctx, pr.Owner, pr.Repo, pr.Number, &github.PullRequestReviewRequest{
 		Event: github.Ptr("REQUEST_CHANGES"),
