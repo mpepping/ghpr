@@ -260,6 +260,92 @@ func TestApproveAndMergeFallsBackToDirectSquashMerge(t *testing.T) {
 	}
 }
 
+func TestApproveAndMergeSkipsSelfAuthoredApproval(t *testing.T) {
+	t.Parallel()
+
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests = append(requests, request.Method+" "+request.URL.Path)
+		switch request.Method + " " + request.URL.Path {
+		case "GET /user":
+			writeJSON(t, writer, map[string]any{"login": "mpepping"})
+		case "POST /repos/mpepping/neovim/pulls/1/reviews":
+			t.Error("self-authored pull request must not be approved")
+			http.Error(writer, "unprocessable entity", http.StatusUnprocessableEntity)
+		case "GET /repos/mpepping/neovim/pulls/1":
+			writeJSON(t, writer, map[string]any{"number": 1, "node_id": "PR_node"})
+		case "POST /graphql":
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"enablePullRequestAutoMerge": map[string]any{}}})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	pull := PullRequest{Owner: "mpepping", Repo: "neovim", Number: 1, Author: "MPepping"}
+	outcome, err := testClient(t, server).ApproveAndMerge(context.Background(), pull)
+	if err != nil {
+		t.Fatalf("ApproveAndMerge() error = %v", err)
+	}
+	if outcome != MergeOutcomeScheduled {
+		t.Fatalf("ApproveAndMerge() = %q, want %q", outcome, MergeOutcomeScheduled)
+	}
+	if got, want := strings.Join(requests, ", "), "GET /user, GET /repos/mpepping/neovim/pulls/1, POST /graphql"; got != want {
+		t.Fatalf("requests = %q, want %q", got, want)
+	}
+}
+
+func TestApproveAndMergeApprovesPullRequestsFromOtherAuthors(t *testing.T) {
+	t.Parallel()
+
+	var approved bool
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.Method + " " + request.URL.Path {
+		case "GET /user":
+			writeJSON(t, writer, map[string]any{"login": "mpepping"})
+		case "POST /repos/mpepping/neovim/pulls/2/reviews":
+			approved = true
+			assertJSONField(t, request, "event", "APPROVE")
+			writeJSON(t, writer, map[string]any{"id": 1})
+		case "GET /repos/mpepping/neovim/pulls/2":
+			writeJSON(t, writer, map[string]any{"number": 2, "node_id": "PR_node"})
+		case "POST /graphql":
+			writeJSON(t, writer, map[string]any{"data": map[string]any{"enablePullRequestAutoMerge": map[string]any{}}})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	pull := PullRequest{Owner: "mpepping", Repo: "neovim", Number: 2, Author: "dependabot[bot]"}
+	if _, err := testClient(t, server).ApproveAndMerge(context.Background(), pull); err != nil {
+		t.Fatalf("ApproveAndMerge() error = %v", err)
+	}
+	if !approved {
+		t.Fatal("pull request from another author was not approved")
+	}
+}
+
+func TestRequestChangesRejectsSelfAuthoredPullRequest(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method+" "+request.URL.Path == "GET /user" {
+			writeJSON(t, writer, map[string]any{"login": "mpepping"})
+			return
+		}
+		t.Errorf("unexpected request %s %s", request.Method, request.URL.Path)
+		http.NotFound(writer, request)
+	}))
+	defer server.Close()
+
+	pull := PullRequest{Owner: "mpepping", Repo: "neovim", Number: 1, Author: "mpepping"}
+	err := testClient(t, server).RequestChanges(context.Background(), pull, "Please add tests")
+	if err == nil || !strings.Contains(err.Error(), "your own pull request") {
+		t.Fatalf("RequestChanges() error = %v, want self-review error", err)
+	}
+}
+
 func TestRequestChangesAndClose(t *testing.T) {
 	t.Parallel()
 

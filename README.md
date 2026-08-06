@@ -114,7 +114,7 @@ ghpr --owner mpepping --limit 100
 
 In the diff viewer, use `space` or `Page Down` to move one page down, `Page Up` to move one page up, and the arrow keys for line-by-line scrolling. Press `esc` or `q` to return to the pull request list.
 
-GitHub does not allow users to approve their own pull requests. Such an action is reported as a per-item failure and the pull request remains selected.
+GitHub does not allow users to review their own pull requests. `ghpr` therefore skips the approval step for pull requests you authored yourself and squash-merges them directly. Requesting changes on your own pull request is reported as a per-item failure and the pull request remains selected.
 
 ## Development
 
