@@ -99,7 +99,7 @@ func ExecuteArgs(ctx context.Context, args []string, stdout, stderr io.Writer) e
 		return nil
 	}
 
-	model := tui.New(ctx, client, resolvedOwner, pulls)
+	model := tui.New(ctx, client, resolvedOwner, *limit, pulls)
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithContext(ctx), tea.WithOutput(stdout))
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("run terminal UI: %w", err)

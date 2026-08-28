@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -12,25 +13,35 @@ import (
 )
 
 type fakeService struct {
-	merged        []string
-	closed        []string
-	reviews       []string
-	diffRequests  []string
-	diffs         map[string]string
-	buildStatuses map[string]githubapi.BuildStatus
-	fail          map[string]error
+	merged       []string
+	closed       []string
+	reviews      []string
+	diffRequests []string
+	diffs        map[string]string
+	states       map[string]githubapi.PullRequestState
+	statesErr    error
+	fail         map[string]error
+
+	listPulls []githubapi.PullRequest
+	listErr   error
+	listCalls int
 }
 
-func (f *fakeService) BuildStatuses(_ context.Context, pulls []githubapi.PullRequest) (map[string]githubapi.BuildStatus, error) {
-	result := make(map[string]githubapi.BuildStatus, len(pulls))
+func (f *fakeService) ListOpenPullRequests(_ context.Context, _ string, _ int) ([]githubapi.PullRequest, error) {
+	f.listCalls++
+	return f.listPulls, f.listErr
+}
+
+func (f *fakeService) PullRequestStates(_ context.Context, pulls []githubapi.PullRequest) (map[string]githubapi.PullRequestState, error) {
+	result := make(map[string]githubapi.PullRequestState, len(pulls))
 	for _, pr := range pulls {
-		if status, ok := f.buildStatuses[pr.Key()]; ok {
-			result[pr.Key()] = status
+		if state, ok := f.states[pr.Key()]; ok {
+			result[pr.Key()] = state
 		} else {
-			result[pr.Key()] = githubapi.BuildStatusNone
+			result[pr.Key()] = githubapi.PullRequestState{Build: githubapi.BuildStatusNone, Mergeable: githubapi.MergeableUnknown}
 		}
 	}
-	return result, nil
+	return result, f.statesErr
 }
 
 func (f *fakeService) Diff(_ context.Context, pr githubapi.PullRequest) (string, error) {
@@ -91,8 +102,8 @@ func TestFinishBatchRemovesSuccessAndKeepsFailure(t *testing.T) {
 		model.selected[pr.Key()] = true
 	}
 
-	message := model.runBatch(context.Background(), actionClose, model.selectedPulls(), "obsolete")().(batchFinishedMsg)
-	model = model.finishBatch(message)
+	model, finished := runBatchToCompletion(t, model, actionClose, "obsolete")
+	model = model.finishBatch(finished)
 
 	if len(service.closed) != 2 {
 		t.Fatalf("Close() calls = %d, want 2", len(service.closed))
@@ -100,11 +111,233 @@ func TestFinishBatchRemovesSuccessAndKeepsFailure(t *testing.T) {
 	if len(model.pulls) != 1 || model.pulls[0].Key() != "acme/two#2" {
 		t.Fatalf("remaining pulls = %#v, want failed pull only", model.pulls)
 	}
+	if len(model.visible) != 1 || model.visible[0].Key() != "acme/two#2" {
+		t.Fatalf("visible pulls = %#v, want the filtered view to follow", model.visible)
+	}
 	if !model.selected["acme/two#2"] {
 		t.Fatal("failed pull request should remain selected")
 	}
 	if !strings.Contains(model.status, "1 closed, 1 failed") || !strings.Contains(model.status, "permission denied") {
 		t.Fatalf("status = %q", model.status)
+	}
+}
+
+// The batch must report every item as it finishes rather than staying silent
+// until the whole run is done.
+func TestBatchReportsPerItemProgress(t *testing.T) {
+	t.Parallel()
+
+	service := &fakeService{fail: map[string]error{"acme/two#2": errors.New("boom")}}
+	model := newTestModel(service)
+	for _, pr := range model.pulls {
+		model.selected[pr.Key()] = true
+	}
+	model = updateModel(t, model, key("m"))
+
+	updated, command := model.Update(key("y"))
+	model = updated.(Model)
+	if model.mode != modeRunning || model.batchTotal != 2 {
+		t.Fatalf("batch did not start: mode=%v total=%d", model.mode, model.batchTotal)
+	}
+	if command == nil {
+		t.Fatal("no command returned to await batch events")
+	}
+
+	// Drain the event stream one message at a time, checking the progress the
+	// user would actually see along the way.
+	var sawStart, sawPartial bool
+	for step := 0; step < 10; step++ {
+		message := <-model.batchEvents
+		if _, ok := message.(batchItemStartedMsg); ok {
+			sawStart = true
+		}
+		model = updateModel(t, model, message)
+		if model.batchDone == 1 && model.mode == modeRunning {
+			sawPartial = true
+			if !strings.Contains(model.View(), "1/2") {
+				t.Fatalf("progress view does not show 1/2:\n%s", model.View())
+			}
+		}
+		if model.mode == modeList {
+			break
+		}
+	}
+
+	if !sawStart {
+		t.Error("no per-item start event was delivered")
+	}
+	if !sawPartial {
+		t.Error("intermediate progress was never visible")
+	}
+	if !strings.Contains(model.status, "1 merged, 1 failed") {
+		t.Fatalf("final status = %q", model.status)
+	}
+	if len(model.pulls) != 1 || model.pulls[0].Key() != "acme/two#2" {
+		t.Fatalf("remaining pulls = %#v", model.pulls)
+	}
+}
+
+// A refresh landing while a batch is running must not orphan the batch: its
+// events still have to be applied, otherwise the UI would hang in modeRunning.
+func TestRefreshDuringBatchDoesNotOrphanIt(t *testing.T) {
+	t.Parallel()
+
+	model := newTestModel(&fakeService{})
+	model.selected["acme/one#1"] = true
+	model = updateModel(t, model, key("m"))
+	model = updateModel(t, model, key("y"))
+	if model.mode != modeRunning {
+		t.Fatalf("mode = %v, want running", model.mode)
+	}
+
+	// An in-flight refresh completes while the batch is still working.
+	model = updateModel(t, model, refreshedMsg{pulls: model.pulls})
+
+	for step := 0; step < 10 && model.mode == modeRunning; step++ {
+		model = updateModel(t, model, <-model.batchEvents)
+	}
+	if model.mode != modeRunning && !strings.Contains(model.status, "1 merged") {
+		t.Fatalf("status = %q, want the batch result", model.status)
+	}
+	if model.mode == modeRunning {
+		t.Fatal("batch events were discarded, UI stayed in running mode")
+	}
+}
+
+func TestFilterNarrowsListAndSelectAllRespectsIt(t *testing.T) {
+	t.Parallel()
+
+	model := New(context.Background(), &fakeService{}, "acme", 100, []githubapi.PullRequest{
+		{Owner: "acme", Repo: "one", Number: 1, Title: "Bump go", Author: "dependabot[bot]", URL: "https://example.test/1"},
+		{Owner: "acme", Repo: "two", Number: 2, Title: "Add feature", Author: "martijn", URL: "https://example.test/2"},
+		{Owner: "acme", Repo: "three", Number: 3, Title: "Bump node", Author: "dependabot[bot]", URL: "https://example.test/3"},
+	})
+
+	model = updateModel(t, model, key("/"))
+	if model.mode != modeFilter {
+		t.Fatalf("mode = %v, want filter", model.mode)
+	}
+	model = typeString(t, model, "dependabot")
+	if len(model.visible) != 2 {
+		t.Fatalf("visible = %d, want 2 dependabot pull requests", len(model.visible))
+	}
+
+	model = updateModel(t, model, key("enter"))
+	if model.mode != modeList || model.filter != "dependabot" {
+		t.Fatalf("mode=%v filter=%q after enter", model.mode, model.filter)
+	}
+
+	// Select all must apply to the filtered rows only.
+	model = updateModel(t, model, key("a"))
+	if len(model.selected) != 2 {
+		t.Fatalf("selected = %d, want only the 2 visible rows", len(model.selected))
+	}
+	if model.selected["acme/two#2"] {
+		t.Error("a filtered-out pull request was selected")
+	}
+
+	// Escape clears the filter but keeps the selection.
+	model = updateModel(t, model, key("esc"))
+	if model.filter != "" || len(model.visible) != 3 {
+		t.Fatalf("esc did not clear the filter: filter=%q visible=%d", model.filter, len(model.visible))
+	}
+	if len(model.selected) != 2 {
+		t.Fatalf("selection changed when clearing the filter: %d", len(model.selected))
+	}
+}
+
+func TestFilterMatchesRepositoryAndNumberAndCancels(t *testing.T) {
+	t.Parallel()
+
+	model := newTestModel(&fakeService{})
+	model = updateModel(t, model, key("/"))
+	model = typeString(t, model, "two")
+	if len(model.visible) != 1 || model.visible[0].Key() != "acme/two#2" {
+		t.Fatalf("repository filter failed: %#v", model.visible)
+	}
+
+	// Escape restores the filter that was active before editing.
+	model = updateModel(t, model, key("esc"))
+	if model.filter != "" || len(model.visible) != 2 {
+		t.Fatalf("cancel did not restore the previous state: filter=%q visible=%d", model.filter, len(model.visible))
+	}
+
+	model = updateModel(t, model, key("/"))
+	model = typeString(t, model, "#1")
+	if len(model.visible) != 1 || model.visible[0].Key() != "acme/one#1" {
+		t.Fatalf("number filter failed: %#v", model.visible)
+	}
+}
+
+func TestRefreshReloadsAndKeepsValidSelection(t *testing.T) {
+	t.Parallel()
+
+	service := &fakeService{listPulls: []githubapi.PullRequest{
+		{Owner: "acme", Repo: "two", Number: 2, Title: "Second", URL: "https://example.test/2"},
+		{Owner: "acme", Repo: "new", Number: 9, Title: "Fresh", URL: "https://example.test/9"},
+	}}
+	model := newTestModel(service)
+	model.selected["acme/one#1"] = true // disappears after the refresh
+	model.selected["acme/two#2"] = true // survives
+
+	updated, command := model.Update(key("R"))
+	model = updated.(Model)
+	if !model.refreshing || command == nil {
+		t.Fatalf("refresh did not start: refreshing=%t command=%v", model.refreshing, command)
+	}
+
+	model = updateModel(t, model, refreshedMsg{pulls: service.listPulls})
+	if model.refreshing {
+		t.Error("refresh flag was not cleared")
+	}
+	if service.listCalls != 0 {
+		// The command itself performs the call; here we injected the result.
+		t.Logf("list calls = %d", service.listCalls)
+	}
+	if len(model.pulls) != 2 || model.pulls[1].Key() != "acme/new#9" {
+		t.Fatalf("pulls after refresh = %#v", model.pulls)
+	}
+	if len(model.selected) != 1 || !model.selected["acme/two#2"] {
+		t.Fatalf("selection after refresh = %#v, want only acme/two#2", model.selected)
+	}
+	if !strings.Contains(model.status, "Refreshed") {
+		t.Fatalf("status = %q", model.status)
+	}
+}
+
+// Results from a load that started before a refresh must not overwrite the new
+// list's state.
+func TestStaleStateResultsAreDiscardedAfterRefresh(t *testing.T) {
+	t.Parallel()
+
+	model := newTestModel(&fakeService{})
+	stale := statesLoadedMsg{
+		generation: model.generation,
+		keys:       []string{"acme/one#1"},
+		states:     map[string]githubapi.PullRequestState{"acme/one#1": {Build: githubapi.BuildStatusSuccess}},
+	}
+
+	model = updateModel(t, model, refreshedMsg{pulls: model.pulls})
+	model = updateModel(t, model, stale)
+
+	if _, ok := model.states["acme/one#1"]; ok {
+		t.Fatal("stale state result was applied after a refresh")
+	}
+}
+
+func TestRefreshFailureIsReported(t *testing.T) {
+	t.Parallel()
+
+	model := newTestModel(&fakeService{})
+	model = updateModel(t, model, refreshedMsg{err: errors.New("rate limited")})
+	if model.refreshing {
+		t.Error("refresh flag was not cleared after failure")
+	}
+	if !strings.Contains(model.status, "Unable to refresh") || !strings.Contains(model.status, "rate limited") {
+		t.Fatalf("status = %q", model.status)
+	}
+	if len(model.pulls) != 2 {
+		t.Fatalf("failed refresh must keep the existing list, got %d", len(model.pulls))
 	}
 }
 
@@ -181,43 +414,97 @@ func TestOpenHighlightedPullRequestInBrowser(t *testing.T) {
 	}
 }
 
-func TestBuildStatusColumnLoadsAsynchronously(t *testing.T) {
+func TestStateColumnsLoadAsynchronously(t *testing.T) {
 	t.Parallel()
 
-	service := &fakeService{buildStatuses: map[string]githubapi.BuildStatus{
-		"acme/one#1": githubapi.BuildStatusSuccess,
-		"acme/two#2": githubapi.BuildStatusFailure,
+	service := &fakeService{states: map[string]githubapi.PullRequestState{
+		"acme/one#1": {Build: githubapi.BuildStatusSuccess, Mergeable: githubapi.MergeableClean, Review: githubapi.ReviewDecisionApproved},
+		"acme/two#2": {Build: githubapi.BuildStatusFailure, Mergeable: githubapi.MergeableConflicting},
 	}}
 	model := newTestModel(service)
+	model = updateModel(t, model, tea.WindowSizeMsg{Width: 120, Height: 20})
 
-	// Init should return a command to load the first batch.
 	command := model.Init()
 	if command == nil {
-		t.Fatal("Init() returned nil, want build status loader")
+		t.Fatal("Init() returned nil, want state loader")
 	}
-
-	// Execute the command and feed the result back.
 	model = updateModel(t, model, command())
 
-	if got := model.buildStatuses["acme/one#1"]; got != githubapi.BuildStatusSuccess {
+	if got := model.states["acme/one#1"].Build; got != githubapi.BuildStatusSuccess {
 		t.Fatalf("build status for one#1 = %q, want success", got)
 	}
-	if got := model.buildStatuses["acme/two#2"]; got != githubapi.BuildStatusFailure {
-		t.Fatalf("build status for two#2 = %q, want failure", got)
+	if got := model.states["acme/two#2"].Mergeable; got != githubapi.MergeableConflicting {
+		t.Fatalf("mergeable for two#2 = %q, want conflicting", got)
 	}
 
-	// View should contain the status icons.
 	view := model.View()
-	if !strings.Contains(view, "✓") {
-		t.Fatal("view should contain success icon ✓")
+	for _, want := range []string{"✓", "✗", "⚠", "AGE", "AUTHOR", "CI", "RV"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("view is missing %q:\n%s", want, view)
+		}
 	}
-	if !strings.Contains(view, "✗") {
-		t.Fatal("view should contain failure icon ✗")
+	if !strings.Contains(view, "CI: success · review: approved") {
+		t.Fatalf("footer should summarise the highlighted PR, got:\n%s", view)
 	}
+}
 
-	// Footer should show the label for the highlighted PR.
-	if !strings.Contains(view, "CI: success") {
-		t.Fatalf("footer should contain CI label, got:\n%s", view)
+// Partial GraphQL failures must keep the data that did arrive and warn about
+// the rest.
+func TestPartialStateFailureKeepsResultsAndWarns(t *testing.T) {
+	t.Parallel()
+
+	service := &fakeService{
+		states:    map[string]githubapi.PullRequestState{"acme/one#1": {Build: githubapi.BuildStatusSuccess}},
+		statesErr: errors.New("Resource not accessible"),
+	}
+	model := newTestModel(service)
+	model = updateModel(t, model, model.Init()())
+
+	if got := model.states["acme/one#1"].Build; got != githubapi.BuildStatusSuccess {
+		t.Fatalf("usable state was discarded: %q", got)
+	}
+	if model.stateWarning == "" {
+		t.Fatal("partial failure was not surfaced to the user")
+	}
+	if !strings.Contains(model.View(), "CI/review data incomplete") {
+		t.Fatalf("warning is not rendered:\n%s", model.View())
+	}
+}
+
+func TestNarrowTerminalDropsOptionalColumns(t *testing.T) {
+	t.Parallel()
+
+	model := newTestModel(&fakeService{})
+	model = updateModel(t, model, tea.WindowSizeMsg{Width: 60, Height: 20})
+	view := model.View()
+	if strings.Contains(view, "AUTHOR") || strings.Contains(view, "AGE") {
+		t.Fatalf("narrow terminal should drop optional columns:\n%s", view)
+	}
+	if !strings.Contains(view, "REPOSITORY") {
+		t.Fatalf("core columns are missing:\n%s", view)
+	}
+}
+
+func TestFormatAge(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		updated time.Time
+		want    string
+	}{
+		{time.Time{}, "-"},
+		{now.Add(-30 * time.Second), "now"},
+		{now.Add(-5 * time.Minute), "5m"},
+		{now.Add(-3 * time.Hour), "3h"},
+		{now.Add(-50 * time.Hour), "2d"},
+		{now.Add(-20 * 24 * time.Hour), "2w"},
+		{now.Add(-800 * 24 * time.Hour), "2y"},
+	}
+	for _, testCase := range cases {
+		if got := formatAge(testCase.updated, now); got != testCase.want {
+			t.Errorf("formatAge(%v) = %q, want %q", testCase.updated, got, testCase.want)
+		}
 	}
 }
 
@@ -237,10 +524,29 @@ func TestRequestChangesRequiresReason(t *testing.T) {
 }
 
 func newTestModel(service GitHubService) Model {
-	return New(context.Background(), service, "acme", []githubapi.PullRequest{
-		{Owner: "acme", Repo: "one", Number: 1, Title: "First", URL: "https://example.test/1"},
-		{Owner: "acme", Repo: "two", Number: 2, Title: "Second", URL: "https://example.test/2"},
+	model := New(context.Background(), service, "acme", 100, []githubapi.PullRequest{
+		{Owner: "acme", Repo: "one", Number: 1, Title: "First", Author: "alice", URL: "https://example.test/1"},
+		{Owner: "acme", Repo: "two", Number: 2, Title: "Second", Author: "bob", URL: "https://example.test/2"},
 	})
+	model.now = func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) }
+	return model
+}
+
+// runBatchToCompletion starts a batch and drains its event stream, returning
+// the final message.
+func runBatchToCompletion(t *testing.T, model Model, selected action, comment string) (Model, batchFinishedMsg) {
+	t.Helper()
+
+	events := make(chan tea.Msg, 64)
+	go model.runBatch(context.Background(), events, selected, model.selectedPulls(), comment, model.batchGeneration)
+
+	for message := range events {
+		if finished, ok := message.(batchFinishedMsg); ok {
+			return model, finished
+		}
+	}
+	t.Fatal("batch never reported completion")
+	return model, batchFinishedMsg{}
 }
 
 func updateModel(t *testing.T, model Model, message tea.Msg) Model {
@@ -249,12 +555,22 @@ func updateModel(t *testing.T, model Model, message tea.Msg) Model {
 	return updated.(Model)
 }
 
+func typeString(t *testing.T, model Model, value string) Model {
+	t.Helper()
+	for _, character := range value {
+		model = updateModel(t, model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{character}})
+	}
+	return model
+}
+
 func key(value string) tea.KeyMsg {
 	switch value {
 	case " ":
 		return tea.KeyMsg{Type: tea.KeySpace}
 	case "enter":
 		return tea.KeyMsg{Type: tea.KeyEnter}
+	case "esc":
+		return tea.KeyMsg{Type: tea.KeyEsc}
 	case "down":
 		return tea.KeyMsg{Type: tea.KeyDown}
 	case "pgup":

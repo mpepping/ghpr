@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	maxSearchResults    = 1000
-	maxBuildStatusBatch = 50
+	maxSearchResults = 1000
+	maxStateBatch    = 50
+	searchPageSize   = 100
 )
 
 var ownerPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`)
@@ -62,6 +63,58 @@ const (
 	BuildStatusFailure BuildStatus = "failure"
 	BuildStatusUnknown BuildStatus = "unknown"
 )
+
+// MergeableState reports whether a pull request can be merged into its base
+// branch without conflicts.
+type MergeableState string
+
+const (
+	MergeableUnknown     MergeableState = "unknown"
+	MergeableClean       MergeableState = "mergeable"
+	MergeableConflicting MergeableState = "conflicting"
+)
+
+// ReviewDecision is the overall review verdict GitHub computed for a pull
+// request, taking branch protection rules into account.
+type ReviewDecision string
+
+const (
+	ReviewDecisionNone             ReviewDecision = ""
+	ReviewDecisionApproved         ReviewDecision = "approved"
+	ReviewDecisionChangesRequested ReviewDecision = "changes requested"
+	ReviewDecisionReviewRequired   ReviewDecision = "review required"
+)
+
+// PullRequestState bundles the signals that decide whether a pull request is
+// ready to merge.
+type PullRequestState struct {
+	Build     BuildStatus
+	Mergeable MergeableState
+	Review    ReviewDecision
+}
+
+// Summary renders the state as a short human readable line.
+func (s PullRequestState) Summary() string {
+	build := string(s.Build)
+	if build == "" {
+		build = string(BuildStatusNone)
+	}
+	parts := []string{"CI: " + build}
+	if s.Review != ReviewDecisionNone {
+		parts = append(parts, "review: "+string(s.Review))
+	}
+	if s.Mergeable == MergeableConflicting {
+		parts = append(parts, "conflicts")
+	}
+	return strings.Join(parts, " · ")
+}
+
+// Blocked reports whether merging this pull request is likely to fail.
+func (s PullRequestState) Blocked() bool {
+	return s.Mergeable == MergeableConflicting ||
+		s.Review == ReviewDecisionChangesRequested ||
+		s.Build == BuildStatusFailure
+}
 
 // MergeOutcome describes what GitHub did after an approve-and-merge action.
 type MergeOutcome string
@@ -146,14 +199,17 @@ func (c *Client) ListOpenPullRequests(ctx context.Context, owner string, limit i
 		return nil, err
 	}
 	query := fmt.Sprintf("is:pr is:open %s:%s archived:false", qualifier, owner)
-	pulls := make([]PullRequest, 0, min(limit, 100))
+	pulls := make([]PullRequest, 0, min(limit, searchPageSize))
+	seen := make(map[string]bool, min(limit, searchPageSize))
 
+	// PerPage must stay constant across pages: GitHub derives the result offset
+	// from (page-1)*per_page, so shrinking it on the last page would re-request
+	// results that were already collected and skip the ones that follow.
 	for page := 1; len(pulls) < limit; page++ {
-		perPage := min(100, limit-len(pulls))
 		result, response, err := c.github.Search.Issues(ctx, query, &github.SearchOptions{
 			Sort:        "updated",
 			Order:       "desc",
-			ListOptions: github.ListOptions{Page: page, PerPage: perPage},
+			ListOptions: github.ListOptions{Page: page, PerPage: searchPageSize},
 		})
 		if err != nil {
 			return nil, fmt.Errorf("search open pull requests for %s: %w", owner, err)
@@ -172,7 +228,7 @@ func (c *Client) ListOpenPullRequests(ctx context.Context, owner string, limit i
 			if issue.UpdatedAt != nil {
 				updatedAt = issue.UpdatedAt.Time
 			}
-			pulls = append(pulls, PullRequest{
+			pull := PullRequest{
 				Owner:     prOwner,
 				Repo:      repo,
 				Number:    issue.GetNumber(),
@@ -181,7 +237,12 @@ func (c *Client) ListOpenPullRequests(ctx context.Context, owner string, limit i
 				Author:    issue.GetUser().GetLogin(),
 				Draft:     issue.GetDraft(),
 				UpdatedAt: updatedAt,
-			})
+			}
+			if seen[pull.Key()] {
+				continue
+			}
+			seen[pull.Key()] = true
+			pulls = append(pulls, pull)
 			if len(pulls) == limit {
 				break
 			}
@@ -215,87 +276,164 @@ func (c *Client) Diff(ctx context.Context, pr PullRequest) (string, error) {
 	return diff, nil
 }
 
-// BuildStatuses returns the aggregate status-check rollup for each pull
-// request's latest commit. Requests are deliberately bounded so callers can
-// load large lists in rate-friendly batches.
-func (c *Client) BuildStatuses(ctx context.Context, pulls []PullRequest) (map[string]BuildStatus, error) {
+// PullRequestStates returns the merge readiness signals (checks rollup, merge
+// conflicts and review decision) for each pull request. Requests are
+// deliberately bounded so callers can load large lists in rate-friendly
+// batches.
+//
+// GraphQL reports per-field errors while still returning data for the other
+// aliases in the same query. PullRequestStates therefore always returns a
+// usable map: pull requests covered by an error are marked unknown, and the
+// combined error messages are returned so callers can surface them without
+// discarding the results that did succeed.
+func (c *Client) PullRequestStates(ctx context.Context, pulls []PullRequest) (map[string]PullRequestState, error) {
 	if len(pulls) == 0 {
-		return map[string]BuildStatus{}, nil
+		return map[string]PullRequestState{}, nil
 	}
-	if len(pulls) > maxBuildStatusBatch {
-		return nil, fmt.Errorf("build status batch contains %d pull requests; maximum is %d", len(pulls), maxBuildStatusBatch)
+	if len(pulls) > maxStateBatch {
+		return nil, fmt.Errorf("pull request state batch contains %d pull requests; maximum is %d", len(pulls), maxStateBatch)
 	}
 
 	declarations := make([]string, 0, len(pulls))
 	selections := make([]string, 0, len(pulls))
 	variables := make(map[string]any, len(pulls))
-	statuses := make(map[string]BuildStatus, len(pulls))
+	states := make(map[string]PullRequestState, len(pulls))
 	for index, pr := range pulls {
 		variable := fmt.Sprintf("url%d", index)
 		alias := fmt.Sprintf("pr%d", index)
 		declarations = append(declarations, "$"+variable+": URI!")
 		selections = append(selections, fmt.Sprintf(`%s: resource(url: $%s) {
   ... on PullRequest {
+    mergeable
+    reviewDecision
     commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
   }
 }`, alias, variable))
 		variables[variable] = pr.URL
-		statuses[pr.Key()] = BuildStatusNone
+		states[pr.Key()] = PullRequestState{Build: BuildStatusNone, Mergeable: MergeableUnknown}
 	}
 
 	requestBody := graphQLRequest{
-		Query:     fmt.Sprintf("query BuildStatuses(%s) {\n%s\n}", strings.Join(declarations, ", "), strings.Join(selections, "\n")),
+		Query:     fmt.Sprintf("query PullRequestStates(%s) {\n%s\n}", strings.Join(declarations, ", "), strings.Join(selections, "\n")),
 		Variables: variables,
 	}
 	request, err := c.github.NewRequest("POST", "graphql", requestBody)
 	if err != nil {
-		return nil, fmt.Errorf("create build status GraphQL request: %w", err)
+		return nil, fmt.Errorf("create pull request state GraphQL request: %w", err)
 	}
 
-	var response buildStatusesGraphQLResponse
+	var response pullRequestStatesGraphQLResponse
 	if _, err := c.github.Do(ctx, request, &response); err != nil {
-		return nil, fmt.Errorf("get pull request build statuses: %w", err)
+		return nil, fmt.Errorf("get pull request states: %w", err)
 	}
 
-	// If there are GraphQL errors, we still process available data and return
-	// partial results. This ensures that a single failing PR doesn't prevent
-	// all others from getting status updates. Individual PR errors will result
-	// in BuildStatusUnknown for those PRs.
-	if len(response.Errors) > 0 {
-		// Note: We don't return an error here. Instead, we continue processing
-		// and return partial results. PRs affected by errors will remain at
-		// their initial BuildStatusNone or be set to BuildStatusUnknown.
+	// Map each error back to the alias it belongs to so unaffected pull
+	// requests keep their real state.
+	failedAliases := make(map[string]bool, len(response.Errors))
+	messages := make([]string, 0, len(response.Errors))
+	for _, graphQLError := range response.Errors {
+		if alias := aliasFromPath(graphQLError.Path); alias != "" {
+			failedAliases[alias] = true
+		}
+		messages = append(messages, graphQLError.Message)
 	}
 
 	for index, pr := range pulls {
-		resource, exists := response.Data[fmt.Sprintf("pr%d", index)]
-		if !exists {
-			// PR data not in response (e.g., due to GraphQL error)
-			statuses[pr.Key()] = BuildStatusUnknown
+		alias := fmt.Sprintf("pr%d", index)
+		resource, exists := response.Data[alias]
+		if failedAliases[alias] || !exists || resource == nil {
+			states[pr.Key()] = PullRequestState{Build: BuildStatusUnknown, Mergeable: MergeableUnknown}
 			continue
 		}
-		if len(resource.Commits.Nodes) == 0 || resource.Commits.Nodes[0].Commit.StatusCheckRollup == nil {
-			// No commit status data available
-			continue
+
+		state := PullRequestState{
+			Build:     BuildStatusNone,
+			Mergeable: mergeableState(resource.Mergeable),
+			Review:    reviewDecision(resource.ReviewDecision),
 		}
-		switch strings.ToUpper(resource.Commits.Nodes[0].Commit.StatusCheckRollup.State) {
-		case "SUCCESS":
-			statuses[pr.Key()] = BuildStatusSuccess
-		case "PENDING", "EXPECTED":
-			statuses[pr.Key()] = BuildStatusPending
-		case "FAILURE", "ERROR":
-			statuses[pr.Key()] = BuildStatusFailure
-		default:
-			statuses[pr.Key()] = BuildStatusUnknown
+		if len(resource.Commits.Nodes) > 0 && resource.Commits.Nodes[0].Commit.StatusCheckRollup != nil {
+			state.Build = buildStatus(resource.Commits.Nodes[0].Commit.StatusCheckRollup.State)
 		}
+		states[pr.Key()] = state
 	}
 
-	return statuses, nil
+	if len(messages) > 0 {
+		return states, fmt.Errorf("pull request state query: %s", strings.Join(dedupe(messages), "; "))
+	}
+	return states, nil
 }
 
-type buildStatusesGraphQLResponse struct {
-	Data map[string]struct {
-		Commits struct {
+func buildStatus(state string) BuildStatus {
+	switch strings.ToUpper(state) {
+	case "SUCCESS":
+		return BuildStatusSuccess
+	case "PENDING", "EXPECTED":
+		return BuildStatusPending
+	case "FAILURE", "ERROR":
+		return BuildStatusFailure
+	default:
+		return BuildStatusUnknown
+	}
+}
+
+func mergeableState(state string) MergeableState {
+	switch strings.ToUpper(state) {
+	case "MERGEABLE":
+		return MergeableClean
+	case "CONFLICTING":
+		return MergeableConflicting
+	default:
+		// UNKNOWN means GitHub is still computing the merge commit.
+		return MergeableUnknown
+	}
+}
+
+func reviewDecision(decision string) ReviewDecision {
+	switch strings.ToUpper(decision) {
+	case "APPROVED":
+		return ReviewDecisionApproved
+	case "CHANGES_REQUESTED":
+		return ReviewDecisionChangesRequested
+	case "REVIEW_REQUIRED":
+		return ReviewDecisionReviewRequired
+	default:
+		// Repositories without required reviews report an empty decision.
+		return ReviewDecisionNone
+	}
+}
+
+// aliasFromPath extracts the query alias ("pr3") a GraphQL error refers to.
+func aliasFromPath(path []any) string {
+	if len(path) == 0 {
+		return ""
+	}
+	segment, ok := path[0].(string)
+	if !ok || !aliasPattern.MatchString(segment) {
+		return ""
+	}
+	return segment
+}
+
+func dedupe(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	unique := make([]string, 0, len(values))
+	for _, value := range values {
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		unique = append(unique, value)
+	}
+	return unique
+}
+
+var aliasPattern = regexp.MustCompile(`^pr\d+$`)
+
+type pullRequestStatesGraphQLResponse struct {
+	Data map[string]*struct {
+		Mergeable      string `json:"mergeable"`
+		ReviewDecision string `json:"reviewDecision"`
+		Commits        struct {
 			Nodes []struct {
 				Commit struct {
 					StatusCheckRollup *struct {
@@ -305,9 +443,7 @@ type buildStatusesGraphQLResponse struct {
 			} `json:"nodes"`
 		} `json:"commits"`
 	} `json:"data"`
-	Errors []struct {
-		Message string `json:"message"`
-	} `json:"errors"`
+	Errors []graphQLError `json:"errors"`
 }
 
 // ApproveAndMerge approves a pull request, then tries to enable squash
@@ -433,9 +569,12 @@ type graphQLResponse struct {
 			} `json:"pullRequest"`
 		} `json:"enablePullRequestAutoMerge"`
 	} `json:"data"`
-	Errors []struct {
-		Message string `json:"message"`
-	} `json:"errors"`
+	Errors []graphQLError `json:"errors"`
+}
+
+type graphQLError struct {
+	Message string `json:"message"`
+	Path    []any  `json:"path"`
 }
 
 func repositoryFromURL(rawURL string) (string, string, error) {
