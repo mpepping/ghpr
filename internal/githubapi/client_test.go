@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -56,7 +57,7 @@ func TestCurrentOwnerAndListOpenPullRequests(t *testing.T) {
 		t.Fatalf("CurrentOwner() = %q, want mpepping", owner)
 	}
 
-	pulls, err := client.ListOpenPullRequests(context.Background(), owner, 100)
+	pulls, err := client.ListOpenPullRequests(context.Background(), SearchOptions{Owner: owner, Limit: 100})
 	if err != nil {
 		t.Fatalf("ListOpenPullRequests() error = %v", err)
 	}
@@ -73,7 +74,7 @@ func TestListOpenPullRequestsRejectsInvalidOwner(t *testing.T) {
 	t.Parallel()
 
 	client := NewClientWithGitHub(github.NewClient(nil))
-	_, err := client.ListOpenPullRequests(context.Background(), "owner is:open", 10)
+	_, err := client.ListOpenPullRequests(context.Background(), SearchOptions{Owner: "owner is:open", Limit: 10})
 	if err == nil || !strings.Contains(err.Error(), "invalid GitHub owner") {
 		t.Fatalf("ListOpenPullRequests() error = %v, want invalid owner error", err)
 	}
@@ -97,12 +98,123 @@ func TestListOpenPullRequestsUsesOrganizationQualifier(t *testing.T) {
 	}))
 	defer server.Close()
 
-	pulls, err := testClient(t, server).ListOpenPullRequests(context.Background(), "acme", 10)
+	pulls, err := testClient(t, server).ListOpenPullRequests(context.Background(), SearchOptions{Owner: "acme", Limit: 10})
 	if err != nil {
 		t.Fatalf("ListOpenPullRequests() error = %v", err)
 	}
 	if len(pulls) != 0 {
 		t.Fatalf("ListOpenPullRequests() returned %d items, want 0", len(pulls))
+	}
+}
+
+// Regression test: PerPage must not shrink on the last page. GitHub derives the
+// offset from (page-1)*per_page, so a smaller final page would re-request rows
+// that were already collected and silently skip the ones after them.
+func TestListOpenPullRequestsPaginatesBeyondOnePage(t *testing.T) {
+	t.Parallel()
+
+	const total = 150
+	var server *httptest.Server
+	var perPageValues []string
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/users/acme":
+			writeJSON(t, writer, map[string]any{"login": "acme", "type": "Organization"})
+		case "/search/issues":
+			query := request.URL.Query()
+			perPageValues = append(perPageValues, query.Get("per_page"))
+			perPage, _ := strconv.Atoi(query.Get("per_page"))
+			page, _ := strconv.Atoi(query.Get("page"))
+			if perPage <= 0 {
+				perPage = 30
+			}
+			if page <= 0 {
+				page = 1
+			}
+
+			// Mirror GitHub's offset arithmetic.
+			start := (page - 1) * perPage
+			end := min(total, start+perPage)
+			items := make([]map[string]any, 0, max(0, end-start))
+			for number := start + 1; number <= end; number++ {
+				items = append(items, map[string]any{
+					"number":         number,
+					"title":          fmt.Sprintf("PR %d", number),
+					"html_url":       fmt.Sprintf("https://github.com/acme/widgets/pull/%d", number),
+					"repository_url": server.URL + "/repos/acme/widgets",
+					"user":           map[string]any{"login": "someone"},
+					"pull_request":   map[string]any{"url": "x"},
+				})
+			}
+			if end < total {
+				writer.Header().Set("Link", fmt.Sprintf(`<%s/search/issues?page=%d>; rel="next"`, server.URL, page+1))
+			}
+			writeJSON(t, writer, map[string]any{"total_count": total, "incomplete_results": false, "items": items})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	pulls, err := testClient(t, server).ListOpenPullRequests(context.Background(), SearchOptions{Owner: "acme", Limit: total})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+	if len(pulls) != total {
+		t.Fatalf("got %d pull requests, want %d", len(pulls), total)
+	}
+	for _, perPage := range perPageValues {
+		if perPage != "100" {
+			t.Fatalf("per_page values = %v, want every page to use 100", perPageValues)
+		}
+	}
+
+	seen := make(map[string]bool, len(pulls))
+	for _, pr := range pulls {
+		if seen[pr.Key()] {
+			t.Fatalf("duplicate pull request %s", pr.Key())
+		}
+		seen[pr.Key()] = true
+	}
+	for number := 1; number <= total; number++ {
+		if !seen[fmt.Sprintf("acme/widgets#%d", number)] {
+			t.Fatalf("pull request #%d is missing from the results", number)
+		}
+	}
+}
+
+// A limit that is not a multiple of the page size must still stop exactly at
+// the limit.
+func TestListOpenPullRequestsHonoursLimit(t *testing.T) {
+	t.Parallel()
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/users/acme":
+			writeJSON(t, writer, map[string]any{"login": "acme", "type": "User"})
+		case "/search/issues":
+			items := make([]map[string]any, 0, 100)
+			for number := 1; number <= 100; number++ {
+				items = append(items, map[string]any{
+					"number":         number,
+					"repository_url": server.URL + "/repos/acme/widgets",
+					"pull_request":   map[string]any{"url": "x"},
+				})
+			}
+			writeJSON(t, writer, map[string]any{"total_count": 100, "incomplete_results": false, "items": items})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	pulls, err := testClient(t, server).ListOpenPullRequests(context.Background(), SearchOptions{Owner: "acme", Limit: 42})
+	if err != nil {
+		t.Fatalf("ListOpenPullRequests() error = %v", err)
+	}
+	if len(pulls) != 42 {
+		t.Fatalf("got %d pull requests, want 42", len(pulls))
 	}
 }
 
@@ -132,7 +244,7 @@ func TestDiff(t *testing.T) {
 	}
 }
 
-func TestBuildStatuses(t *testing.T) {
+func TestPullRequestStates(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -142,22 +254,109 @@ func TestBuildStatuses(t *testing.T) {
 		}
 		var body graphQLRequest
 		decodeJSON(t, request, &body)
-		if !strings.Contains(body.Query, "statusCheckRollup") || !strings.Contains(body.Query, "commits(last: 1)") {
-			t.Errorf("unexpected build status query: %q", body.Query)
+		for _, fragment := range []string{"statusCheckRollup", "commits(last: 1)", "mergeable", "reviewDecision"} {
+			if !strings.Contains(body.Query, fragment) {
+				t.Errorf("query is missing %q: %s", fragment, body.Query)
+			}
 		}
 		if got := body.Variables["url1"]; got != "https://github.com/acme/widgets/pull/2" {
 			t.Errorf("url1 variable = %v", got)
 		}
 		writeJSON(t, writer, map[string]any{"data": map[string]any{
-			"pr0": map[string]any{"commits": map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"statusCheckRollup": map[string]any{"state": "SUCCESS"}}}}}},
-			"pr1": map[string]any{"commits": map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"statusCheckRollup": map[string]any{"state": "PENDING"}}}}}},
-			"pr2": map[string]any{"commits": map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"statusCheckRollup": map[string]any{"state": "ERROR"}}}}}},
-			"pr3": map[string]any{"commits": map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"statusCheckRollup": nil}}}}},
+			"pr0": map[string]any{
+				"mergeable":      "MERGEABLE",
+				"reviewDecision": "APPROVED",
+				"commits":        rollup("SUCCESS"),
+			},
+			"pr1": map[string]any{
+				"mergeable":      "CONFLICTING",
+				"reviewDecision": "REVIEW_REQUIRED",
+				"commits":        rollup("PENDING"),
+			},
+			"pr2": map[string]any{
+				"mergeable":      "UNKNOWN",
+				"reviewDecision": "CHANGES_REQUESTED",
+				"commits":        rollup("ERROR"),
+			},
+			"pr3": map[string]any{
+				"mergeable":      "MERGEABLE",
+				"reviewDecision": nil,
+				"commits":        map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"statusCheckRollup": nil}}}},
+			},
 		}})
 	}))
 	defer server.Close()
 
-	pulls := make([]PullRequest, 4)
+	pulls := testPulls(4)
+	states, err := testClient(t, server).PullRequestStates(context.Background(), pulls)
+	if err != nil {
+		t.Fatalf("PullRequestStates() error = %v", err)
+	}
+	want := []PullRequestState{
+		{Build: BuildStatusSuccess, Mergeable: MergeableClean, Review: ReviewDecisionApproved},
+		{Build: BuildStatusPending, Mergeable: MergeableConflicting, Review: ReviewDecisionReviewRequired},
+		{Build: BuildStatusFailure, Mergeable: MergeableUnknown, Review: ReviewDecisionChangesRequested},
+		{Build: BuildStatusNone, Mergeable: MergeableClean, Review: ReviewDecisionNone},
+	}
+	for index, pr := range pulls {
+		if got := states[pr.Key()]; got != want[index] {
+			t.Errorf("state for %s = %#v, want %#v", pr.Key(), got, want[index])
+		}
+	}
+}
+
+// A GraphQL error for one alias must not discard the data returned for the
+// others, and the message must reach the caller instead of being swallowed.
+func TestPullRequestStatesReturnsPartialResultsAndError(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/graphql" {
+			http.NotFound(writer, request)
+			return
+		}
+		writeJSON(t, writer, map[string]any{
+			"data": map[string]any{
+				"pr0": map[string]any{"mergeable": "MERGEABLE", "reviewDecision": "APPROVED", "commits": rollup("SUCCESS")},
+				"pr1": nil,
+			},
+			"errors": []map[string]any{{
+				"message": "Resource not accessible by integration",
+				"path":    []any{"pr1"},
+			}},
+		})
+	}))
+	defer server.Close()
+
+	pulls := testPulls(2)
+	states, err := testClient(t, server).PullRequestStates(context.Background(), pulls)
+	if err == nil || !strings.Contains(err.Error(), "not accessible") {
+		t.Fatalf("PullRequestStates() error = %v, want the GraphQL message", err)
+	}
+	if got := states[pulls[0].Key()]; got.Build != BuildStatusSuccess || got.Review != ReviewDecisionApproved {
+		t.Errorf("healthy pull request lost its state: %#v", got)
+	}
+	if got := states[pulls[1].Key()]; got.Build != BuildStatusUnknown {
+		t.Errorf("failed pull request state = %#v, want unknown build", got)
+	}
+}
+
+func TestPullRequestStatesRejectsOversizedBatch(t *testing.T) {
+	t.Parallel()
+
+	pulls := make([]PullRequest, MaxStateBatch+1)
+	_, err := NewClientWithGitHub(github.NewClient(nil)).PullRequestStates(context.Background(), pulls)
+	if err == nil || !strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("PullRequestStates() error = %v, want batch limit error", err)
+	}
+}
+
+func rollup(state string) map[string]any {
+	return map[string]any{"nodes": []any{map[string]any{"commit": map[string]any{"statusCheckRollup": map[string]any{"state": state}}}}}
+}
+
+func testPulls(count int) []PullRequest {
+	pulls := make([]PullRequest, count)
 	for index := range pulls {
 		pulls[index] = PullRequest{
 			Owner:  "acme",
@@ -166,26 +365,7 @@ func TestBuildStatuses(t *testing.T) {
 			URL:    fmt.Sprintf("https://github.com/acme/widgets/pull/%d", index+1),
 		}
 	}
-	statuses, err := testClient(t, server).BuildStatuses(context.Background(), pulls)
-	if err != nil {
-		t.Fatalf("BuildStatuses() error = %v", err)
-	}
-	want := []BuildStatus{BuildStatusSuccess, BuildStatusPending, BuildStatusFailure, BuildStatusNone}
-	for index, pr := range pulls {
-		if got := statuses[pr.Key()]; got != want[index] {
-			t.Errorf("status for %s = %q, want %q", pr.Key(), got, want[index])
-		}
-	}
-}
-
-func TestBuildStatusesRejectsOversizedBatch(t *testing.T) {
-	t.Parallel()
-
-	pulls := make([]PullRequest, maxBuildStatusBatch+1)
-	_, err := NewClientWithGitHub(github.NewClient(nil)).BuildStatuses(context.Background(), pulls)
-	if err == nil || !strings.Contains(err.Error(), "maximum") {
-		t.Fatalf("BuildStatuses() error = %v, want batch limit error", err)
-	}
+	return pulls
 }
 
 func TestApproveAndMergeEnablesAutoMerge(t *testing.T) {
@@ -383,7 +563,7 @@ func TestRequestChangesAndClose(t *testing.T) {
 	}
 }
 
-func testClient(t *testing.T, server *httptest.Server) *Client {
+func testClient(t *testing.T, server *httptest.Server, options ...Option) *Client {
 	t.Helper()
 	baseURL, err := url.Parse(server.URL + "/")
 	if err != nil {
@@ -392,7 +572,7 @@ func testClient(t *testing.T, server *httptest.Server) *Client {
 	client := github.NewClient(server.Client())
 	client.BaseURL = baseURL
 	client.UploadURL = baseURL
-	return NewClientWithGitHub(client)
+	return NewClientWithGitHub(client, options...)
 }
 
 func writeJSON(t *testing.T, writer http.ResponseWriter, value any) {
