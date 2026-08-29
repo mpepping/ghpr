@@ -2,6 +2,10 @@
 
 `ghpr` is a terminal UI for reviewing and managing open pull requests across repositories owned by a GitHub user or organization.
 
+<p align="center">
+  <img src="reference/tui.png" alt="TUI" width="800" />
+</p>
+
 ## Features
 
 - Find open pull requests across all non-archived repositories owned by a GitHub account, or scope the search to reviews requested from you.
@@ -21,6 +25,7 @@
 
 > [!WARNING]
 > Merge and close are destructive actions. Take time to review PR's. Use `--dry-run` when in doubt.
+
 
 ## Installation
 
@@ -187,6 +192,8 @@ Each record looks like this:
 ```
 
 ### TUI keys
+
+![TUI](reference/tui.png)
 
 Press `?` in the UI for the same list.
 
