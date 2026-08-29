@@ -20,7 +20,7 @@ func TestTokenFromHostsUsesActiveUser(t *testing.T) {
     octocat:
       oauth_token: token-active
 `)
-	token, err := tokenFromHosts(contents)
+	token, err := tokenFromHosts(contents, DefaultHost)
 	if err != nil {
 		t.Fatalf("tokenFromHosts() error = %v", err)
 	}
@@ -37,7 +37,7 @@ func TestTokenFromHostsSupportsLegacyFormat(t *testing.T) {
   oauth_token: token-legacy
   git_protocol: https
 `)
-	token, err := tokenFromHosts(contents)
+	token, err := tokenFromHosts(contents, DefaultHost)
 	if err != nil {
 		t.Fatalf("tokenFromHosts() error = %v", err)
 	}
@@ -55,7 +55,7 @@ func TestTokenFromPathPrefersExistingHostsFile(t *testing.T) {
 		t.Fatalf("write hosts file: %v", err)
 	}
 
-	token, err := tokenFromPath(path, envValues(map[string]string{"GH_TOKEN": "token-from-env"}))
+	token, err := tokenFromPath(path, DefaultHost, envValues(map[string]string{"GH_TOKEN": "token-from-env"}))
 	if err != nil {
 		t.Fatalf("tokenFromPath() error = %v", err)
 	}
@@ -68,7 +68,7 @@ func TestTokenFromPathUsesEnvironmentWhenFileDoesNotExist(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "missing", "hosts.yml")
-	token, err := tokenFromPath(path, envValues(map[string]string{
+	token, err := tokenFromPath(path, DefaultHost, envValues(map[string]string{
 		"GH_TOKEN":     " token-from-gh ",
 		"GITHUB_TOKEN": "token-from-github",
 	}))
@@ -88,7 +88,7 @@ func TestTokenFromPathDoesNotUseEnvironmentForInvalidExistingFile(t *testing.T) 
 		t.Fatalf("write hosts file: %v", err)
 	}
 
-	_, err := tokenFromPath(path, envValues(map[string]string{"GH_TOKEN": "token-from-env"}))
+	_, err := tokenFromPath(path, DefaultHost, envValues(map[string]string{"GH_TOKEN": "token-from-env"}))
 	if err == nil || !strings.Contains(err.Error(), "no OAuth token") {
 		t.Fatalf("tokenFromPath() error = %v, want missing OAuth token error", err)
 	}
@@ -150,5 +150,39 @@ func TestHostsPathPrecedence(t *testing.T) {
 func envValues(values map[string]string) func(string) string {
 	return func(key string) string {
 		return values[key]
+	}
+}
+
+func TestTokenForEnterpriseHost(t *testing.T) {
+	t.Parallel()
+
+	contents := []byte("github.com:\n  oauth_token: public\ngithub.example.com:\n  user: martijn\n  users:\n    martijn:\n      oauth_token: enterprise\n")
+
+	token, err := tokenFromHosts(contents, "github.example.com")
+	if err != nil {
+		t.Fatalf("tokenFromHosts() error = %v", err)
+	}
+	if token != "enterprise" {
+		t.Fatalf("tokenFromHosts() = %q, want the enterprise token", token)
+	}
+
+	if _, err := tokenFromHosts(contents, "missing.example.com"); err == nil {
+		t.Fatal("an unknown host must be reported")
+	}
+}
+
+func TestNormalizeHost(t *testing.T) {
+	t.Parallel()
+
+	for input, want := range map[string]string{
+		"":                            DefaultHost,
+		"  ":                          DefaultHost,
+		"GitHub.com":                  "github.com",
+		"https://github.example.com/": "github.example.com",
+		"http://ghe.internal":         "ghe.internal",
+	} {
+		if got := normalizeHost(input); got != want {
+			t.Errorf("normalizeHost(%q) = %q, want %q", input, got, want)
+		}
 	}
 }

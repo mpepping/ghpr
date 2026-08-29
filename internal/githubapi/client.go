@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -15,11 +16,101 @@ import (
 
 const (
 	maxSearchResults = 1000
-	maxStateBatch    = 50
-	searchPageSize   = 100
+	// MaxStateBatch is the largest batch PullRequestStates accepts.
+	MaxStateBatch  = 50
+	searchPageSize = 100
+
+	// DefaultTimeout bounds a single API call so a hung request cannot freeze
+	// the UI indefinitely.
+	DefaultTimeout = 30 * time.Second
+	// diffTimeout is more generous: large diffs are slow to generate.
+	diffTimeout = 3 * time.Minute
 )
 
 var ownerPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`)
+
+// MergeMethod selects how GitHub combines the commits of a pull request.
+type MergeMethod string
+
+const (
+	MergeMethodSquash MergeMethod = "squash"
+	MergeMethodMerge  MergeMethod = "merge"
+	MergeMethodRebase MergeMethod = "rebase"
+)
+
+// ParseMergeMethod validates a user supplied merge method.
+func ParseMergeMethod(value string) (MergeMethod, error) {
+	switch MergeMethod(strings.ToLower(strings.TrimSpace(value))) {
+	case MergeMethodSquash:
+		return MergeMethodSquash, nil
+	case MergeMethodMerge:
+		return MergeMethodMerge, nil
+	case MergeMethodRebase:
+		return MergeMethodRebase, nil
+	default:
+		return "", fmt.Errorf("invalid merge method %q: use squash, merge or rebase", value)
+	}
+}
+
+// GraphQL returns the PullRequestMergeMethod enum value.
+func (m MergeMethod) GraphQL() string {
+	return strings.ToUpper(string(m))
+}
+
+// Label describes the method the way it is shown in prompts.
+func (m MergeMethod) Label() string {
+	switch m {
+	case MergeMethodRebase:
+		return "rebase-merge"
+	case MergeMethodMerge:
+		return "merge commit"
+	default:
+		return "squash-merge"
+	}
+}
+
+// Scope selects which open pull requests are listed.
+type Scope string
+
+const (
+	// ScopeOwned lists pull requests in repositories owned by the account.
+	ScopeOwned Scope = "owned"
+	// ScopeReviewRequested lists pull requests waiting for the viewer's review.
+	ScopeReviewRequested Scope = "review-requested"
+	// ScopeInvolved lists pull requests the viewer authored, commented on,
+	// was assigned to or was mentioned in.
+	ScopeInvolved Scope = "involved"
+	// ScopeAuthored lists pull requests the viewer opened.
+	ScopeAuthored Scope = "authored"
+)
+
+// ParseScope validates a user supplied scope.
+func ParseScope(value string) (Scope, error) {
+	switch Scope(strings.ToLower(strings.TrimSpace(value))) {
+	case ScopeOwned:
+		return ScopeOwned, nil
+	case ScopeReviewRequested:
+		return ScopeReviewRequested, nil
+	case ScopeInvolved:
+		return ScopeInvolved, nil
+	case ScopeAuthored:
+		return ScopeAuthored, nil
+	default:
+		return "", fmt.Errorf("invalid scope %q: use owned, review-requested, involved or authored", value)
+	}
+}
+
+// RequiresOwner reports whether the scope is meaningless without an owner.
+func (s Scope) RequiresOwner() bool {
+	return s == "" || s == ScopeOwned
+}
+
+// SearchOptions describes which pull requests to load.
+type SearchOptions struct {
+	Owner string
+	Scope Scope
+	Limit int
+}
 
 // ValidateOwner checks if the given owner string is a valid GitHub username or organization name.
 // It returns an error if the owner is invalid.
@@ -122,25 +213,124 @@ type MergeOutcome string
 const (
 	MergeOutcomeMerged    MergeOutcome = "merged"
 	MergeOutcomeScheduled MergeOutcome = "auto-merge enabled"
+	MergeOutcomeDryRun    MergeOutcome = "dry run"
 )
+
+// Config describes how the client talks to GitHub.
+type Config struct {
+	Token string
+	// Host is the GitHub host. Empty or "github.com" uses the public API,
+	// anything else is treated as a GitHub Enterprise Server instance.
+	Host         string
+	MergeMethod  MergeMethod
+	DeleteBranch bool
+	// DryRun makes every state-changing call a no-op that reports success.
+	DryRun  bool
+	Timeout time.Duration
+}
 
 // Client performs the GitHub operations used by ghpr.
 type Client struct {
-	github *github.Client
+	github       *github.Client
+	mergeMethod  MergeMethod
+	deleteBranch bool
+	dryRun       bool
+	timeout      time.Duration
 
 	viewerMu    sync.Mutex
 	viewerLogin string
 }
 
-// NewClient creates an authenticated client for github.com.
-func NewClient(token string) *Client {
-	return NewClientWithGitHub(github.NewClient(nil).WithAuthToken(token))
+// Option customizes a Client.
+type Option func(*Client)
+
+// WithMergeMethod selects the merge strategy used by ApproveAndMerge.
+func WithMergeMethod(method MergeMethod) Option {
+	return func(c *Client) {
+		if method != "" {
+			c.mergeMethod = method
+		}
+	}
+}
+
+// WithDeleteBranch deletes the head branch after a direct merge.
+func WithDeleteBranch(enabled bool) Option {
+	return func(c *Client) { c.deleteBranch = enabled }
+}
+
+// WithDryRun turns every state-changing call into a no-op.
+func WithDryRun(enabled bool) Option {
+	return func(c *Client) { c.dryRun = enabled }
+}
+
+// WithTimeout bounds the duration of a single API call.
+func WithTimeout(timeout time.Duration) Option {
+	return func(c *Client) {
+		if timeout > 0 {
+			c.timeout = timeout
+		}
+	}
+}
+
+// New creates an authenticated client from cfg.
+func New(cfg Config) (*Client, error) {
+	httpClient := &http.Client{Transport: newRetryTransport(nil)}
+	client := github.NewClient(httpClient).WithAuthToken(cfg.Token)
+
+	if host := normalizeHost(cfg.Host); host != "" && host != defaultHost {
+		enterprise, err := client.WithEnterpriseURLs("https://"+host, "https://"+host)
+		if err != nil {
+			return nil, fmt.Errorf("configure GitHub Enterprise host %q: %w", cfg.Host, err)
+		}
+		client = enterprise
+	}
+
+	return NewClientWithGitHub(client,
+		WithMergeMethod(cfg.MergeMethod),
+		WithDeleteBranch(cfg.DeleteBranch),
+		WithDryRun(cfg.DryRun),
+		WithTimeout(cfg.Timeout),
+	), nil
 }
 
 // NewClientWithGitHub wraps a go-github client. It is primarily useful for tests
 // and callers that need to customize the HTTP transport or API base URL.
-func NewClientWithGitHub(client *github.Client) *Client {
-	return &Client{github: client}
+func NewClientWithGitHub(client *github.Client, options ...Option) *Client {
+	wrapped := &Client{
+		github:      client,
+		mergeMethod: MergeMethodSquash,
+		timeout:     DefaultTimeout,
+	}
+	for _, option := range options {
+		option(wrapped)
+	}
+	return wrapped
+}
+
+const defaultHost = "github.com"
+
+// normalizeHost reduces a host such as "https://github.example.com/" to its
+// bare hostname.
+func normalizeHost(host string) string {
+	host = strings.TrimSpace(host)
+	host = strings.TrimPrefix(host, "https://")
+	host = strings.TrimPrefix(host, "http://")
+	return strings.ToLower(strings.Trim(host, "/"))
+}
+
+// MergeMethod reports the configured merge strategy.
+func (c *Client) MergeMethod() MergeMethod { return c.mergeMethod }
+
+// DryRun reports whether state-changing calls are suppressed.
+func (c *Client) DryRun() bool { return c.dryRun }
+
+// withTimeout bounds a single API call. Callers that already have a deadline
+// keep the earlier of the two.
+func (c *Client) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.timeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, c.timeout)
 }
 
 // CurrentOwner returns the login belonging to the authenticated token.
@@ -184,21 +374,18 @@ func (c *Client) authoredByViewer(ctx context.Context, pr PullRequest) bool {
 	return strings.EqualFold(login, pr.Author)
 }
 
-// ListOpenPullRequests finds open pull requests in repositories owned by owner.
+// ListOpenPullRequests finds open pull requests matching options.
 // GitHub's search API returns at most 1,000 results for any query.
-func (c *Client) ListOpenPullRequests(ctx context.Context, owner string, limit int) ([]PullRequest, error) {
-	if !ownerPattern.MatchString(owner) {
-		return nil, fmt.Errorf("invalid GitHub owner %q", owner)
-	}
+func (c *Client) ListOpenPullRequests(ctx context.Context, options SearchOptions) ([]PullRequest, error) {
+	limit := options.Limit
 	if limit <= 0 || limit > maxSearchResults {
 		limit = maxSearchResults
 	}
 
-	qualifier, err := c.ownerQualifier(ctx, owner)
+	query, err := c.buildQuery(ctx, options)
 	if err != nil {
 		return nil, err
 	}
-	query := fmt.Sprintf("is:pr is:open %s:%s archived:false", qualifier, owner)
 	pulls := make([]PullRequest, 0, min(limit, searchPageSize))
 	seen := make(map[string]bool, min(limit, searchPageSize))
 
@@ -206,13 +393,15 @@ func (c *Client) ListOpenPullRequests(ctx context.Context, owner string, limit i
 	// from (page-1)*per_page, so shrinking it on the last page would re-request
 	// results that were already collected and skip the ones that follow.
 	for page := 1; len(pulls) < limit; page++ {
-		result, response, err := c.github.Search.Issues(ctx, query, &github.SearchOptions{
+		pageCtx, cancel := c.withTimeout(ctx)
+		result, response, err := c.github.Search.Issues(pageCtx, query, &github.SearchOptions{
 			Sort:        "updated",
 			Order:       "desc",
 			ListOptions: github.ListOptions{Page: page, PerPage: searchPageSize},
 		})
+		cancel()
 		if err != nil {
-			return nil, fmt.Errorf("search open pull requests for %s: %w", owner, err)
+			return nil, fmt.Errorf("search open pull requests: %s", Explain(err))
 		}
 
 		for _, issue := range result.Issues {
@@ -256,10 +445,50 @@ func (c *Client) ListOpenPullRequests(ctx context.Context, owner string, limit i
 	return pulls, nil
 }
 
+// buildQuery turns the scope and owner into a GitHub search query.
+func (c *Client) buildQuery(ctx context.Context, options SearchOptions) (string, error) {
+	scope := options.Scope
+	if scope == "" {
+		scope = ScopeOwned
+	}
+	owner := strings.TrimSpace(options.Owner)
+	if owner == "" && scope.RequiresOwner() {
+		return "", errors.New("an owner is required for the owned scope")
+	}
+	if owner != "" && !ownerPattern.MatchString(owner) {
+		return "", fmt.Errorf("invalid GitHub owner %q", owner)
+	}
+
+	terms := []string{"is:pr", "is:open"}
+	switch scope {
+	case ScopeReviewRequested:
+		terms = append(terms, "review-requested:@me")
+	case ScopeInvolved:
+		terms = append(terms, "involves:@me")
+	case ScopeAuthored:
+		terms = append(terms, "author:@me")
+	}
+
+	// The owner narrows every scope, but only the owned scope needs to know
+	// whether it is a user or an organization.
+	if owner != "" {
+		qualifier, err := c.ownerQualifier(ctx, owner)
+		if err != nil {
+			return "", err
+		}
+		terms = append(terms, qualifier+":"+owner)
+	}
+	terms = append(terms, "archived:false")
+	return strings.Join(terms, " "), nil
+}
+
 func (c *Client) ownerQualifier(ctx context.Context, owner string) (string, error) {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+
 	account, _, err := c.github.Users.Get(ctx, owner)
 	if err != nil {
-		return "", fmt.Errorf("get GitHub owner %s: %w", owner, err)
+		return "", fmt.Errorf("get GitHub owner %s: %s", owner, Explain(err))
 	}
 	if strings.EqualFold(account.GetType(), "Organization") {
 		return "org", nil
@@ -269,9 +498,12 @@ func (c *Client) ownerQualifier(ctx context.Context, owner string) (string, erro
 
 // Diff returns a pull request's unified diff.
 func (c *Client) Diff(ctx context.Context, pr PullRequest) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, diffTimeout)
+	defer cancel()
+
 	diff, _, err := c.github.PullRequests.GetRaw(ctx, pr.Owner, pr.Repo, pr.Number, github.RawOptions{Type: github.Diff})
 	if err != nil {
-		return "", fmt.Errorf("get diff for %s: %w", pr.Key(), err)
+		return "", fmt.Errorf("get diff for %s: %s", pr.Key(), Explain(err))
 	}
 	return diff, nil
 }
@@ -290,8 +522,8 @@ func (c *Client) PullRequestStates(ctx context.Context, pulls []PullRequest) (ma
 	if len(pulls) == 0 {
 		return map[string]PullRequestState{}, nil
 	}
-	if len(pulls) > maxStateBatch {
-		return nil, fmt.Errorf("pull request state batch contains %d pull requests; maximum is %d", len(pulls), maxStateBatch)
+	if len(pulls) > MaxStateBatch {
+		return nil, fmt.Errorf("pull request state batch contains %d pull requests; maximum is %d", len(pulls), MaxStateBatch)
 	}
 
 	declarations := make([]string, 0, len(pulls))
@@ -322,9 +554,12 @@ func (c *Client) PullRequestStates(ctx context.Context, pulls []PullRequest) (ma
 		return nil, fmt.Errorf("create pull request state GraphQL request: %w", err)
 	}
 
+	stateCtx, cancel := c.withTimeout(ctx)
+	defer cancel()
+
 	var response pullRequestStatesGraphQLResponse
-	if _, err := c.github.Do(ctx, request, &response); err != nil {
-		return nil, fmt.Errorf("get pull request states: %w", err)
+	if _, err := c.github.Do(stateCtx, request, &response); err != nil {
+		return nil, fmt.Errorf("get pull request states: %s", Explain(err))
 	}
 
 	// Map each error back to the alias it belongs to so unaffected pull
@@ -444,116 +679,6 @@ type pullRequestStatesGraphQLResponse struct {
 		} `json:"commits"`
 	} `json:"data"`
 	Errors []graphQLError `json:"errors"`
-}
-
-// ApproveAndMerge approves a pull request, then tries to enable squash
-// auto-merge. If auto-merge is unavailable, it falls back to a direct squash
-// merge, matching the behavior of the reference shell script.
-//
-// Pull requests opened by the authenticated user are merged without an
-// approving review, because GitHub does not allow approving your own work.
-func (c *Client) ApproveAndMerge(ctx context.Context, pr PullRequest) (MergeOutcome, error) {
-	if !c.authoredByViewer(ctx, pr) {
-		_, _, err := c.github.PullRequests.CreateReview(ctx, pr.Owner, pr.Repo, pr.Number, &github.PullRequestReviewRequest{
-			Event: github.Ptr("APPROVE"),
-		})
-		if err != nil {
-			return "", fmt.Errorf("approve %s: %w", pr.Key(), err)
-		}
-	}
-
-	autoOutcome, autoErr := c.enableAutoMerge(ctx, pr)
-	if autoErr == nil {
-		return autoOutcome, nil
-	}
-
-	result, _, mergeErr := c.github.PullRequests.Merge(ctx, pr.Owner, pr.Repo, pr.Number, "", &github.PullRequestOptions{
-		MergeMethod: "squash",
-	})
-	if mergeErr != nil {
-		return "", fmt.Errorf("enable auto-merge: %v; direct squash merge: %w", autoErr, mergeErr)
-	}
-	if !result.GetMerged() {
-		return "", fmt.Errorf("enable auto-merge: %v; direct squash merge rejected: %s", autoErr, result.GetMessage())
-	}
-	return MergeOutcomeMerged, nil
-}
-
-// RequestChanges submits a pull request review that requests changes.
-func (c *Client) RequestChanges(ctx context.Context, pr PullRequest, body string) error {
-	body = strings.TrimSpace(body)
-	if body == "" {
-		return errors.New("a reason is required when requesting changes")
-	}
-	if c.authoredByViewer(ctx, pr) {
-		return fmt.Errorf("request changes on %s: GitHub does not allow reviewing your own pull request", pr.Key())
-	}
-	_, _, err := c.github.PullRequests.CreateReview(ctx, pr.Owner, pr.Repo, pr.Number, &github.PullRequestReviewRequest{
-		Event: github.Ptr("REQUEST_CHANGES"),
-		Body:  github.Ptr(body),
-	})
-	if err != nil {
-		return fmt.Errorf("request changes on %s: %w", pr.Key(), err)
-	}
-	return nil
-}
-
-// Close closes a pull request, adding a comment first when body is not empty.
-func (c *Client) Close(ctx context.Context, pr PullRequest, body string) error {
-	body = strings.TrimSpace(body)
-	if body != "" {
-		_, _, err := c.github.Issues.CreateComment(ctx, pr.Owner, pr.Repo, pr.Number, &github.IssueComment{Body: github.Ptr(body)})
-		if err != nil {
-			return fmt.Errorf("comment on %s before closing: %w", pr.Key(), err)
-		}
-	}
-
-	_, _, err := c.github.Issues.Edit(ctx, pr.Owner, pr.Repo, pr.Number, &github.IssueRequest{
-		State: github.Ptr("closed"),
-	})
-	if err != nil {
-		return fmt.Errorf("close %s: %w", pr.Key(), err)
-	}
-	return nil
-}
-
-func (c *Client) enableAutoMerge(ctx context.Context, pr PullRequest) (MergeOutcome, error) {
-	fullPR, _, err := c.github.PullRequests.Get(ctx, pr.Owner, pr.Repo, pr.Number)
-	if err != nil {
-		return "", fmt.Errorf("get pull request node ID: %w", err)
-	}
-	if fullPR.GetNodeID() == "" {
-		return "", errors.New("GitHub returned a pull request without a node ID")
-	}
-
-	request := graphQLRequest{
-		Query: `mutation EnableAutoMerge($pullRequestId: ID!) {
-  enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: SQUASH}) {
-    pullRequest { merged autoMergeRequest { enabledAt } }
-  }
-}`,
-		Variables: map[string]any{"pullRequestId": fullPR.GetNodeID()},
-	}
-	httpRequest, err := c.github.NewRequest("POST", "graphql", request)
-	if err != nil {
-		return "", fmt.Errorf("create GraphQL request: %w", err)
-	}
-
-	var response graphQLResponse
-	if _, err := c.github.Do(ctx, httpRequest, &response); err != nil {
-		return "", err
-	}
-	if len(response.Errors) > 0 {
-		messages := make([]string, 0, len(response.Errors))
-		for _, graphQLError := range response.Errors {
-			messages = append(messages, graphQLError.Message)
-		}
-		return "", errors.New(strings.Join(messages, "; "))
-	}
-	if response.Data.EnableAutoMerge.PullRequest.Merged {
-		return MergeOutcomeMerged, nil
-	}
-	return MergeOutcomeScheduled, nil
 }
 
 type graphQLRequest struct {

@@ -57,7 +57,7 @@ func TestCurrentOwnerAndListOpenPullRequests(t *testing.T) {
 		t.Fatalf("CurrentOwner() = %q, want mpepping", owner)
 	}
 
-	pulls, err := client.ListOpenPullRequests(context.Background(), owner, 100)
+	pulls, err := client.ListOpenPullRequests(context.Background(), SearchOptions{Owner: owner, Limit: 100})
 	if err != nil {
 		t.Fatalf("ListOpenPullRequests() error = %v", err)
 	}
@@ -74,7 +74,7 @@ func TestListOpenPullRequestsRejectsInvalidOwner(t *testing.T) {
 	t.Parallel()
 
 	client := NewClientWithGitHub(github.NewClient(nil))
-	_, err := client.ListOpenPullRequests(context.Background(), "owner is:open", 10)
+	_, err := client.ListOpenPullRequests(context.Background(), SearchOptions{Owner: "owner is:open", Limit: 10})
 	if err == nil || !strings.Contains(err.Error(), "invalid GitHub owner") {
 		t.Fatalf("ListOpenPullRequests() error = %v, want invalid owner error", err)
 	}
@@ -98,7 +98,7 @@ func TestListOpenPullRequestsUsesOrganizationQualifier(t *testing.T) {
 	}))
 	defer server.Close()
 
-	pulls, err := testClient(t, server).ListOpenPullRequests(context.Background(), "acme", 10)
+	pulls, err := testClient(t, server).ListOpenPullRequests(context.Background(), SearchOptions{Owner: "acme", Limit: 10})
 	if err != nil {
 		t.Fatalf("ListOpenPullRequests() error = %v", err)
 	}
@@ -156,7 +156,7 @@ func TestListOpenPullRequestsPaginatesBeyondOnePage(t *testing.T) {
 	}))
 	defer server.Close()
 
-	pulls, err := testClient(t, server).ListOpenPullRequests(context.Background(), "acme", total)
+	pulls, err := testClient(t, server).ListOpenPullRequests(context.Background(), SearchOptions{Owner: "acme", Limit: total})
 	if err != nil {
 		t.Fatalf("ListOpenPullRequests() error = %v", err)
 	}
@@ -209,7 +209,7 @@ func TestListOpenPullRequestsHonoursLimit(t *testing.T) {
 	}))
 	defer server.Close()
 
-	pulls, err := testClient(t, server).ListOpenPullRequests(context.Background(), "acme", 42)
+	pulls, err := testClient(t, server).ListOpenPullRequests(context.Background(), SearchOptions{Owner: "acme", Limit: 42})
 	if err != nil {
 		t.Fatalf("ListOpenPullRequests() error = %v", err)
 	}
@@ -344,7 +344,7 @@ func TestPullRequestStatesReturnsPartialResultsAndError(t *testing.T) {
 func TestPullRequestStatesRejectsOversizedBatch(t *testing.T) {
 	t.Parallel()
 
-	pulls := make([]PullRequest, maxStateBatch+1)
+	pulls := make([]PullRequest, MaxStateBatch+1)
 	_, err := NewClientWithGitHub(github.NewClient(nil)).PullRequestStates(context.Background(), pulls)
 	if err == nil || !strings.Contains(err.Error(), "maximum") {
 		t.Fatalf("PullRequestStates() error = %v, want batch limit error", err)
@@ -563,7 +563,7 @@ func TestRequestChangesAndClose(t *testing.T) {
 	}
 }
 
-func testClient(t *testing.T, server *httptest.Server) *Client {
+func testClient(t *testing.T, server *httptest.Server, options ...Option) *Client {
 	t.Helper()
 	baseURL, err := url.Parse(server.URL + "/")
 	if err != nil {
@@ -572,7 +572,7 @@ func testClient(t *testing.T, server *httptest.Server) *Client {
 	client := github.NewClient(server.Client())
 	client.BaseURL = baseURL
 	client.UploadURL = baseURL
-	return NewClientWithGitHub(client)
+	return NewClientWithGitHub(client, options...)
 }
 
 func writeJSON(t *testing.T, writer http.ResponseWriter, value any) {

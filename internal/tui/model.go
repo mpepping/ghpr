@@ -3,14 +3,17 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/mpepping/ghpr/internal/browser"
 	"github.com/mpepping/ghpr/internal/githubapi"
@@ -18,11 +21,14 @@ import (
 
 // GitHubService is the part of the GitHub API used by the TUI.
 type GitHubService interface {
-	ListOpenPullRequests(context.Context, string, int) ([]githubapi.PullRequest, error)
+	ListOpenPullRequests(context.Context, githubapi.SearchOptions) ([]githubapi.PullRequest, error)
 	PullRequestStates(context.Context, []githubapi.PullRequest) (map[string]githubapi.PullRequestState, error)
 	Diff(context.Context, githubapi.PullRequest) (string, error)
+	Approve(context.Context, githubapi.PullRequest) error
 	ApproveAndMerge(context.Context, githubapi.PullRequest) (githubapi.MergeOutcome, error)
 	RequestChanges(context.Context, githubapi.PullRequest, string) error
+	Comment(context.Context, githubapi.PullRequest, string) error
+	UpdateBranch(context.Context, githubapi.PullRequest) error
 	Close(context.Context, githubapi.PullRequest, string) error
 }
 
@@ -31,13 +37,16 @@ const stateBatchSize = 25
 type mode int
 
 const (
-	modeList mode = iota
+	modeLoading mode = iota
+	modeList
 	modeFilter
 	modeComment
 	modeConfirm
 	modeRunning
 	modeDiffLoading
 	modeDiff
+	modeHelp
+	modeLog
 )
 
 type action int
@@ -45,9 +54,66 @@ type action int
 const (
 	actionNone action = iota
 	actionMerge
+	actionApprove
 	actionClose
 	actionRequestChanges
+	actionComment
+	actionUpdateBranch
 )
+
+// needsBody reports whether the action collects a message before running.
+func (a action) needsBody() bool {
+	return a == actionClose || a == actionRequestChanges || a == actionComment
+}
+
+// requiresBody reports whether that message is mandatory.
+func (a action) requiresBody() bool {
+	return a == actionRequestChanges || a == actionComment
+}
+
+func (a action) verb() string {
+	switch a {
+	case actionMerge:
+		return "approve and merge"
+	case actionApprove:
+		return "approve"
+	case actionClose:
+		return "close"
+	case actionRequestChanges:
+		return "request changes on"
+	case actionComment:
+		return "comment on"
+	case actionUpdateBranch:
+		return "update the branch of"
+	default:
+		return "act on"
+	}
+}
+
+func (a action) progressLabel() string {
+	switch a {
+	case actionMerge:
+		return "Approving and merging"
+	case actionApprove:
+		return "Approving"
+	case actionClose:
+		return "Closing"
+	case actionRequestChanges:
+		return "Requesting changes"
+	case actionComment:
+		return "Commenting"
+	case actionUpdateBranch:
+		return "Updating branches"
+	default:
+		return "Working"
+	}
+}
+
+// removesPullRequest reports whether a successful action takes the pull
+// request out of the list.
+func (a action) removesPullRequest() bool {
+	return a == actionMerge || a == actionClose
+}
 
 type actionResult struct {
 	pr      githubapi.PullRequest
@@ -55,16 +121,11 @@ type actionResult struct {
 	err     error
 }
 
-// batchItemStartedMsg is emitted just before an action runs for a pull request
-// so the UI can name the item currently being processed.
 type batchItemStartedMsg struct {
 	generation int
-	index      int
 	pr         githubapi.PullRequest
 }
 
-// batchItemDoneMsg reports the outcome of a single pull request, letting the
-// list update incrementally instead of waiting for the whole batch.
 type batchItemDoneMsg struct {
 	generation int
 	result     actionResult
@@ -74,12 +135,6 @@ type batchFinishedMsg struct {
 	generation int
 	action     action
 	results    []actionResult
-}
-
-type diffLoadedMsg struct {
-	key     string
-	content string
-	err     error
 }
 
 type urlOpenedMsg struct {
@@ -94,40 +149,44 @@ type statesLoadedMsg struct {
 	err        error
 }
 
-type refreshedMsg struct {
-	pulls []githubapi.PullRequest
-	err   error
+type pullsLoadedMsg struct {
+	pulls   []githubapi.PullRequest
+	err     error
+	initial bool
 }
 
-var (
-	titleStyle        = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
-	helpStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	selectedStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	cursorStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	errorStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	statusStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-	draftStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	filterStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
-	staleStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
-	authorStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	diffFileStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	diffHeaderStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("45"))
-	diffAddStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	diffDeleteStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	diffMetaStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	buildSuccessStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
-	buildPendingStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
-	buildFailureStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
-	buildUnknownStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
-)
+type editorFinishedMsg struct {
+	body string
+	err  error
+}
+
+// logEntry is one line in the session log.
+type logEntry struct {
+	at      time.Time
+	message string
+	failed  bool
+}
+
+// Options configures a Model.
+type Options struct {
+	Context     context.Context
+	Service     GitHubService
+	Search      githubapi.SearchOptions
+	MergeMethod githubapi.MergeMethod
+	DryRun      bool
+	Filter      string
+	Editor      string
+}
 
 // Model is the ghpr Bubble Tea model.
 type Model struct {
-	ctx     context.Context
-	service GitHubService
-	owner   string
-	limit   int
-	now     func() time.Time
+	ctx         context.Context
+	service     GitHubService
+	search      githubapi.SearchOptions
+	mergeMethod githubapi.MergeMethod
+	dryRun      bool
+	editor      string
+	now         func() time.Time
 
 	// pulls holds every loaded pull request; visible holds the subset that
 	// passes the active filter. The cursor always indexes into visible.
@@ -141,23 +200,22 @@ type Model struct {
 	mode        mode
 	pending     action
 	comment     string
-	input       textinput.Model
+	input       textarea.Model
 	filterInput textinput.Model
 	filter      string
 	filterDraft string
 	spinner     spinner.Model
 	viewport    viewport.Model
-	diffPR      githubapi.PullRequest
 	openURL     func(string) error
+
+	diff      diffState
+	diffCache map[string]string
 
 	states       map[string]githubapi.PullRequestState
 	stateQueue   []githubapi.PullRequest
 	stateNext    int
 	stateWarning string
 
-	// generation invalidates in-flight state loads after a refresh so results
-	// for a stale pull request list are discarded. Batches carry their own
-	// counter: a refresh must never orphan a batch that is already running.
 	generation      int
 	batchGeneration int
 	refreshing      bool
@@ -170,16 +228,18 @@ type Model struct {
 	batchCurrent string
 	batchResults []actionResult
 
+	log    []logEntry
 	cancel context.CancelFunc
 	status string
 }
 
-// New creates a multi-select pull request model.
-func New(ctx context.Context, service GitHubService, owner string, limit int, pulls []githubapi.PullRequest) Model {
-	pullList := append([]githubapi.PullRequest(nil), pulls...)
-	input := textinput.New()
-	input.CharLimit = 500
-	input.Width = 70
+// New creates a pull request model. The pull request list is loaded by Init so
+// the user sees a spinner instead of a frozen terminal.
+func New(options Options) Model {
+	body := textarea.New()
+	body.CharLimit = 4000
+	body.SetHeight(4)
+	body.ShowLineNumbers = false
 
 	filter := textinput.New()
 	filter.Prompt = "/"
@@ -193,28 +253,47 @@ func New(ctx context.Context, service GitHubService, owner string, limit int, pu
 	diffViewport := viewport.New(80, 20)
 	diffViewport.SetHorizontalStep(8)
 
+	mergeMethod := options.MergeMethod
+	if mergeMethod == "" {
+		mergeMethod = githubapi.MergeMethodSquash
+	}
+
 	model := Model{
-		ctx:         ctx,
-		service:     service,
-		owner:       owner,
-		limit:       limit,
+		ctx:         options.Context,
+		service:     options.Service,
+		search:      options.Search,
+		mergeMethod: mergeMethod,
+		dryRun:      options.DryRun,
+		editor:      options.Editor,
 		now:         time.Now,
-		pulls:       pullList,
 		selected:    make(map[string]bool),
-		input:       input,
+		input:       body,
 		filterInput: filter,
+		filter:      strings.TrimSpace(options.Filter),
 		spinner:     activity,
 		viewport:    diffViewport,
 		openURL:     browser.Open,
+		diffCache:   make(map[string]string),
 		states:      make(map[string]githubapi.PullRequestState),
-		stateQueue:  append([]githubapi.PullRequest(nil), pullList...),
+		mode:        modeLoading,
 	}
-	return model.applyFilter()
+	if model.filter != "" {
+		model.filterInput.SetValue(model.filter)
+	}
+	return model
 }
 
 // Init implements tea.Model.
 func (m Model) Init() tea.Cmd {
-	return m.loadNextStateBatch()
+	return tea.Batch(m.spinner.Tick, m.loadPulls(true))
+}
+
+func (m Model) loadPulls(initial bool) tea.Cmd {
+	search := m.search
+	return func() tea.Msg {
+		pulls, err := m.service.ListOpenPullRequests(m.ctx, search)
+		return pullsLoadedMsg{pulls: pulls, err: err, initial: initial}
+	}
 }
 
 // Update implements tea.Model.
@@ -223,11 +302,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.input.Width = max(20, min(80, msg.Width-6))
+		m.input.SetWidth(max(20, min(100, msg.Width-6)))
 		m.filterInput.Width = max(20, min(80, msg.Width-6))
 		m.viewport.Width = max(1, msg.Width)
-		m.viewport.Height = max(1, msg.Height-3)
+		m.viewport.Height = max(1, msg.Height-4)
 		return m, nil
+	case pullsLoadedMsg:
+		return m.finishLoad(msg)
 	case batchItemStartedMsg:
 		if msg.generation != m.batchGeneration {
 			return m, nil
@@ -243,6 +324,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.result.err != nil {
 			m.batchFailed++
 		}
+		m = m.recordResult(msg.result)
 		return m, waitForBatchEvent(m.batchEvents)
 	case batchFinishedMsg:
 		if msg.generation != m.batchGeneration {
@@ -251,8 +333,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m.finishBatch(msg), nil
 	case diffLoadedMsg:
 		return m.finishDiff(msg), nil
-	case refreshedMsg:
-		return m.finishRefresh(msg)
+	case editorFinishedMsg:
+		return m.finishEditor(msg)
 	case urlOpenedMsg:
 		if msg.err != nil {
 			m.status = "Unable to open " + msg.key + " in the default browser: " + msg.err.Error()
@@ -263,8 +345,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case statesLoadedMsg:
 		return m.finishStateBatch(msg)
 	case spinner.TickMsg:
-		// The spinner also runs in list mode while a refresh is in flight.
-		if m.refreshing || m.mode == modeRunning || m.mode == modeDiffLoading {
+		if m.refreshing || m.mode == modeRunning || m.mode == modeDiffLoading || m.mode == modeLoading {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(message)
 			return m, cmd
@@ -281,6 +362,15 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch m.mode {
+	case modeLoading:
+		if msg, ok := message.(tea.KeyMsg); ok && msg.String() == "q" {
+			return m, tea.Quit
+		}
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(message)
+		return m, cmd
+	case modeHelp, modeLog:
+		return m.updateOverlay(message)
 	case modeFilter:
 		return m.updateFilter(message)
 	case modeComment:
@@ -300,6 +390,60 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
+func (m Model) finishLoad(message pullsLoadedMsg) (tea.Model, tea.Cmd) {
+	m.refreshing = false
+	if message.err != nil {
+		if message.initial {
+			m.mode = modeList
+			m.status = "Unable to load pull requests: " + message.err.Error()
+			return m, nil
+		}
+		m.status = "Unable to refresh: " + message.err.Error()
+		return m, nil
+	}
+
+	// Invalidate in-flight state loads for the previous list.
+	m.generation++
+	m.pulls = append([]githubapi.PullRequest(nil), message.pulls...)
+	if m.mode == modeLoading {
+		m.mode = modeList
+	}
+
+	// Keep selections that still refer to an open pull request.
+	live := make(map[string]bool, len(m.pulls))
+	for _, pr := range m.pulls {
+		live[pr.Key()] = true
+	}
+	for key := range m.selected {
+		if !live[key] {
+			delete(m.selected, key)
+		}
+	}
+
+	// Carry over known states so the columns do not flash back to "loading",
+	// then re-query everything to pick up new CI and review results.
+	states := make(map[string]githubapi.PullRequestState, len(m.pulls))
+	for _, pr := range m.pulls {
+		if state, ok := m.states[pr.Key()]; ok {
+			states[pr.Key()] = state
+		}
+	}
+	m.states = states
+	m.stateQueue = append([]githubapi.PullRequest(nil), m.pulls...)
+	m.stateNext = 0
+	m.stateWarning = ""
+	// Diffs may have changed since they were cached.
+	m.diffCache = make(map[string]string)
+
+	m = m.applyFilter()
+	if message.initial {
+		m.status = ""
+	} else {
+		m.status = fmt.Sprintf("Refreshed: %d open pull request(s).", len(m.pulls))
+	}
+	return m, m.loadNextStateBatch()
+}
+
 // current returns the highlighted pull request, if the visible list is not empty.
 func (m Model) current() (githubapi.PullRequest, bool) {
 	if len(m.visible) == 0 || m.cursor < 0 || m.cursor >= len(m.visible) {
@@ -315,7 +459,6 @@ func (m Model) applyFilter() Model {
 
 	terms := strings.Fields(strings.ToLower(m.filter))
 	if len(terms) == 0 {
-		// Copy so later in-place edits of pulls cannot corrupt visible.
 		m.visible = append([]githubapi.PullRequest(nil), m.pulls...)
 	} else {
 		visible := make([]githubapi.PullRequest, 0, len(m.pulls))
@@ -393,6 +536,7 @@ func (m Model) finishStateBatch(message statesLoadedMsg) (tea.Model, tea.Cmd) {
 	}
 	if message.err != nil {
 		m.stateWarning = message.err.Error()
+		m.log = append(m.log, logEntry{at: m.now(), message: "state query: " + message.err.Error(), failed: true})
 	}
 	m.stateNext += len(message.keys)
 	return m, m.loadNextStateBatch()
@@ -408,14 +552,22 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 	case "q":
 		return m, tea.Quit
 	case "esc":
-		// Escape clears the filter instead of quitting, so it is consistent
-		// with the cancel meaning it has in every other mode.
 		if m.filter != "" {
 			m.filter = ""
 			m.filterInput.Reset()
 			m.status = ""
 			return m.applyFilter(), nil
 		}
+		return m, nil
+	case "?":
+		m.mode = modeHelp
+		m.viewport.SetContent(helpContent())
+		m.viewport.GotoTop()
+		return m, nil
+	case "L":
+		m.mode = modeLog
+		m.viewport.SetContent(m.logContent())
+		m.viewport.GotoBottom()
 		return m, nil
 	case "up", "k":
 		if m.cursor > 0 {
@@ -456,16 +608,37 @@ func (m Model) updateList(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m.startRefresh()
 	case "m":
 		return m.prepareAction(actionMerge)
+	case "A":
+		return m.prepareAction(actionApprove)
 	case "c":
 		return m.prepareAction(actionClose)
 	case "r":
 		return m.prepareAction(actionRequestChanges)
+	case "C":
+		return m.prepareAction(actionComment)
+	case "u":
+		return m.prepareAction(actionUpdateBranch)
 	case "d":
 		return m.openDiff()
 	case "w":
 		return m.openHighlightedURL()
 	}
 	return m, nil
+}
+
+// updateOverlay drives the help and log viewers.
+func (m Model) updateOverlay(message tea.Msg) (tea.Model, tea.Cmd) {
+	if msg, ok := message.(tea.KeyMsg); ok {
+		switch msg.String() {
+		case "esc", "q", "?", "L":
+			m.mode = modeList
+			m.viewport.SetContent("")
+			return m, nil
+		}
+	}
+	var cmd tea.Cmd
+	m.viewport, cmd = m.viewport.Update(message)
+	return m, cmd
 }
 
 // toggleSelectAll operates on the visible rows only, which makes
@@ -495,7 +668,6 @@ func (m Model) updateFilter(message tea.Msg) (tea.Model, tea.Cmd) {
 	if msg, ok := message.(tea.KeyMsg); ok {
 		switch msg.String() {
 		case "esc":
-			// Restore the filter that was active before editing started.
 			m.filter = m.filterDraft
 			m.filterInput.SetValue(m.filter)
 			m.filterInput.Blur()
@@ -512,7 +684,6 @@ func (m Model) updateFilter(message tea.Msg) (tea.Model, tea.Cmd) {
 
 	var cmd tea.Cmd
 	m.filterInput, cmd = m.filterInput.Update(message)
-	// Filter as the user types so the result list is always in sync.
 	m.filter = m.filterInput.Value()
 	return m.applyFilter(), cmd
 }
@@ -523,51 +694,7 @@ func (m Model) startRefresh() (tea.Model, tea.Cmd) {
 	}
 	m.refreshing = true
 	m.status = "Refreshing pull requests…"
-	owner, limit := m.owner, m.limit
-	return m, tea.Batch(m.spinner.Tick, func() tea.Msg {
-		pulls, err := m.service.ListOpenPullRequests(m.ctx, owner, limit)
-		return refreshedMsg{pulls: pulls, err: err}
-	})
-}
-
-func (m Model) finishRefresh(message refreshedMsg) (tea.Model, tea.Cmd) {
-	m.refreshing = false
-	if message.err != nil {
-		m.status = "Unable to refresh: " + message.err.Error()
-		return m, nil
-	}
-
-	// Invalidate in-flight state loads for the previous list.
-	m.generation++
-	m.pulls = append([]githubapi.PullRequest(nil), message.pulls...)
-
-	// Keep selections that still refer to an open pull request.
-	live := make(map[string]bool, len(m.pulls))
-	for _, pr := range m.pulls {
-		live[pr.Key()] = true
-	}
-	for key := range m.selected {
-		if !live[key] {
-			delete(m.selected, key)
-		}
-	}
-
-	// Carry over known states so the columns do not flash back to "loading",
-	// then re-query everything to pick up new CI and review results.
-	states := make(map[string]githubapi.PullRequestState, len(m.pulls))
-	for _, pr := range m.pulls {
-		if state, ok := m.states[pr.Key()]; ok {
-			states[pr.Key()] = state
-		}
-	}
-	m.states = states
-	m.stateQueue = append([]githubapi.PullRequest(nil), m.pulls...)
-	m.stateNext = 0
-	m.stateWarning = ""
-
-	m = m.applyFilter()
-	m.status = fmt.Sprintf("Refreshed: %d open pull request(s).", len(m.pulls))
-	return m, m.loadNextStateBatch()
+	return m, tea.Batch(m.spinner.Tick, m.loadPulls(false))
 }
 
 func (m Model) openHighlightedURL() (tea.Model, tea.Cmd) {
@@ -582,88 +709,6 @@ func (m Model) openHighlightedURL() (tea.Model, tea.Cmd) {
 	}
 }
 
-func (m Model) openDiff() (tea.Model, tea.Cmd) {
-	pr, ok := m.current()
-	if !ok {
-		return m, nil
-	}
-
-	ctx, cancel := context.WithCancel(m.ctx)
-	m.cancel = cancel
-	m.diffPR = pr
-	m.mode = modeDiffLoading
-	m.status = ""
-	m.viewport.SetContent("")
-	m.viewport.GotoTop()
-	return m, tea.Batch(m.spinner.Tick, m.loadDiff(ctx, m.diffPR))
-}
-
-func (m Model) loadDiff(ctx context.Context, pr githubapi.PullRequest) tea.Cmd {
-	return func() tea.Msg {
-		content, err := m.service.Diff(ctx, pr)
-		return diffLoadedMsg{key: pr.Key(), content: content, err: err}
-	}
-}
-
-func (m Model) finishDiff(message diffLoadedMsg) Model {
-	if m.mode != modeDiffLoading || message.key != m.diffPR.Key() {
-		return m
-	}
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
-	}
-	if message.err != nil {
-		m.status = "Unable to load diff: " + message.err.Error()
-		m.mode = modeList
-		m.diffPR = githubapi.PullRequest{}
-		return m
-	}
-
-	content := message.content
-	if strings.TrimSpace(content) == "" {
-		content = "No changes in this pull request."
-	}
-	m.viewport.SetContent(highlightDiff(content))
-	m.viewport.GotoTop()
-	m.mode = modeDiff
-	return m
-}
-
-func (m Model) updateDiffLoading(message tea.Msg) (tea.Model, tea.Cmd) {
-	if msg, ok := message.(tea.KeyMsg); ok {
-		if msg.String() == "esc" || msg.String() == "q" {
-			return m.closeDiff(), nil
-		}
-	}
-	var cmd tea.Cmd
-	m.spinner, cmd = m.spinner.Update(message)
-	return m, cmd
-}
-
-func (m Model) updateDiff(message tea.Msg) (tea.Model, tea.Cmd) {
-	if msg, ok := message.(tea.KeyMsg); ok {
-		if msg.String() == "esc" || msg.String() == "q" {
-			return m.closeDiff(), nil
-		}
-	}
-	var cmd tea.Cmd
-	m.viewport, cmd = m.viewport.Update(message)
-	return m, cmd
-}
-
-func (m Model) closeDiff() Model {
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
-	}
-	m.mode = modeList
-	m.diffPR = githubapi.PullRequest{}
-	m.viewport.SetContent("")
-	m.status = ""
-	return m
-}
-
 func (m Model) prepareAction(next action) (tea.Model, tea.Cmd) {
 	if len(m.selected) == 0 {
 		m.status = "Select one or more pull requests first."
@@ -673,16 +718,19 @@ func (m Model) prepareAction(next action) (tea.Model, tea.Cmd) {
 	m.pending = next
 	m.comment = ""
 	m.status = ""
-	if next == actionMerge {
+	if !next.needsBody() {
 		m.mode = modeConfirm
 		return m, nil
 	}
 
 	m.mode = modeComment
 	m.input.Reset()
-	if next == actionClose {
+	switch next {
+	case actionClose:
 		m.input.Placeholder = "Optional comment before closing"
-	} else {
+	case actionComment:
+		m.input.Placeholder = "Comment to post (required)"
+	default:
 		m.input.Placeholder = "Reason for requesting changes (required)"
 	}
 	return m, m.input.Focus()
@@ -696,10 +744,12 @@ func (m Model) updateComment(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.pending = actionNone
 			m.input.Blur()
 			return m, nil
-		case "enter":
+		case "ctrl+e":
+			return m.openEditor()
+		case "ctrl+d":
 			m.comment = strings.TrimSpace(m.input.Value())
-			if m.pending == actionRequestChanges && m.comment == "" {
-				m.status = "A reason is required when requesting changes."
+			if m.pending.requiresBody() && m.comment == "" {
+				m.status = "A message is required for this action."
 				return m, nil
 			}
 			m.status = ""
@@ -712,6 +762,70 @@ func (m Model) updateComment(message tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(message)
 	return m, cmd
+}
+
+// openEditor hands the review body to $EDITOR so long, multi-line and
+// markdown-heavy messages can be written comfortably.
+func (m Model) openEditor() (tea.Model, tea.Cmd) {
+	editor := m.editorCommand()
+	if editor == "" {
+		m.status = "Set $EDITOR (or editor: in the config file) to compose in an external editor."
+		return m, nil
+	}
+
+	file, err := os.CreateTemp("", "ghpr-*.md")
+	if err != nil {
+		m.status = "Unable to create a temporary file: " + err.Error()
+		return m, nil
+	}
+	name := file.Name()
+	if _, err := file.WriteString(m.input.Value()); err != nil {
+		file.Close()
+		os.Remove(name)
+		m.status = "Unable to write the temporary file: " + err.Error()
+		return m, nil
+	}
+	file.Close()
+
+	parts := strings.Fields(editor)
+	command := exec.Command(parts[0], append(parts[1:], name)...) // #nosec G204 -- the editor comes from the user's own configuration
+	return m, tea.ExecProcess(command, func(err error) tea.Msg {
+		defer os.Remove(name)
+		if err != nil {
+			return editorFinishedMsg{err: err}
+		}
+		contents, readErr := os.ReadFile(name) // #nosec G304 -- path created by this process
+		if readErr != nil {
+			return editorFinishedMsg{err: readErr}
+		}
+		return editorFinishedMsg{body: string(contents)}
+	})
+}
+
+func (m Model) editorCommand() string {
+	if m.editor != "" {
+		return m.editor
+	}
+	for _, name := range []string{"GHPR_EDITOR", "VISUAL", "EDITOR"} {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			return value
+		}
+	}
+	// A sensible last resort that exists nearly everywhere.
+	if path, err := exec.LookPath("vi"); err == nil {
+		return filepath.Base(path)
+	}
+	return ""
+}
+
+func (m Model) finishEditor(message editorFinishedMsg) (tea.Model, tea.Cmd) {
+	if message.err != nil {
+		m.status = "Editor failed: " + message.err.Error()
+		return m, nil
+	}
+	m.input.SetValue(strings.TrimRight(message.body, "\n"))
+	m.input.CursorEnd()
+	return m, m.input.Focus()
 }
 
 func (m Model) updateConfirm(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -783,11 +897,11 @@ func (m Model) runBatch(ctx context.Context, events chan<- tea.Msg, selectedActi
 	defer close(events)
 
 	results := make([]actionResult, 0, len(pulls))
-	for index, pr := range pulls {
+	for _, pr := range pulls {
 		if ctx.Err() != nil {
 			break
 		}
-		events <- batchItemStartedMsg{generation: generation, index: index, pr: pr}
+		events <- batchItemStartedMsg{generation: generation, pr: pr}
 
 		result := actionResult{pr: pr}
 		switch selectedAction {
@@ -795,17 +909,40 @@ func (m Model) runBatch(ctx context.Context, events chan<- tea.Msg, selectedActi
 			outcome, err := m.service.ApproveAndMerge(ctx, pr)
 			result.outcome = string(outcome)
 			result.err = err
+		case actionApprove:
+			result.outcome = "approved"
+			result.err = m.service.Approve(ctx, pr)
 		case actionClose:
 			result.outcome = "closed"
 			result.err = m.service.Close(ctx, pr, comment)
 		case actionRequestChanges:
 			result.outcome = "changes requested"
 			result.err = m.service.RequestChanges(ctx, pr, comment)
+		case actionComment:
+			result.outcome = "commented"
+			result.err = m.service.Comment(ctx, pr, comment)
+		case actionUpdateBranch:
+			result.outcome = "branch updated"
+			result.err = m.service.UpdateBranch(ctx, pr)
 		}
 		results = append(results, result)
 		events <- batchItemDoneMsg{generation: generation, result: result}
 	}
 	events <- batchFinishedMsg{generation: generation, action: selectedAction, results: results}
+}
+
+// recordResult appends an entry to the session log so nothing is lost when the
+// status line is overwritten.
+func (m Model) recordResult(result actionResult) Model {
+	entry := logEntry{at: m.now()}
+	if result.err != nil {
+		entry.failed = true
+		entry.message = result.pr.Key() + ": " + result.err.Error()
+	} else {
+		entry.message = result.pr.Key() + " " + result.outcome
+	}
+	m.log = append(m.log, entry)
+	return m
 }
 
 func (m Model) finishBatch(message batchFinishedMsg) Model {
@@ -816,12 +953,12 @@ func (m Model) finishBatch(message batchFinishedMsg) Model {
 	m.batchEvents = nil
 
 	succeeded := make(map[string]bool)
-	failures := make([]string, 0)
+	failures := 0
 	outcomes := make(map[string]int)
 
 	for _, result := range message.results {
 		if result.err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", result.pr.Key(), result.err))
+			failures++
 			continue
 		}
 		succeeded[result.pr.Key()] = true
@@ -829,7 +966,7 @@ func (m Model) finishBatch(message batchFinishedMsg) Model {
 		delete(m.selected, result.pr.Key())
 	}
 
-	if message.action == actionMerge || message.action == actionClose {
+	if message.action.removesPullRequest() && !m.dryRun {
 		remaining := make([]githubapi.PullRequest, 0, len(m.pulls))
 		for _, pr := range m.pulls {
 			if !succeeded[pr.Key()] {
@@ -837,27 +974,24 @@ func (m Model) finishBatch(message batchFinishedMsg) Model {
 			}
 		}
 		m.pulls = remaining
+		m.stateQueue = pruneQueue(m.stateQueue, succeeded, &m.stateNext)
 	}
 
 	summary := make([]string, 0, len(outcomes)+1)
-	for _, name := range []string{"merged", "auto-merge enabled", "closed", "changes requested"} {
+	for _, name := range []string{"merged", "auto-merge enabled", "dry run", "approved", "closed", "changes requested", "commented", "branch updated"} {
 		if count := outcomes[name]; count > 0 {
 			summary = append(summary, fmt.Sprintf("%d %s", count, name))
 		}
 	}
-	if len(failures) > 0 {
-		summary = append(summary, fmt.Sprintf("%d failed", len(failures)))
+	if failures > 0 {
+		summary = append(summary, fmt.Sprintf("%d failed", failures))
 	}
 	if len(summary) == 0 {
 		summary = append(summary, "nothing to do")
 	}
 	status := "Completed: " + strings.Join(summary, ", ")
-	for index, failure := range failures {
-		if index == 3 {
-			status += fmt.Sprintf("\n…and %d more error(s)", len(failures)-index)
-			break
-		}
-		status += "\n" + failure
+	if failures > 0 {
+		status += "  (press L for the full log)"
 	}
 
 	m.mode = modeList
@@ -866,6 +1000,27 @@ func (m Model) finishBatch(message batchFinishedMsg) Model {
 	m = m.applyFilter()
 	m.status = status
 	return m
+}
+
+// pruneQueue drops finished pull requests from the pending state queue so no
+// requests are made for pull requests that already left the list.
+func pruneQueue(queue []githubapi.PullRequest, done map[string]bool, next *int) []githubapi.PullRequest {
+	if len(done) == 0 {
+		return queue
+	}
+	pruned := make([]githubapi.PullRequest, 0, len(queue))
+	removedBeforeCursor := 0
+	for index, pr := range queue {
+		if done[pr.Key()] {
+			if index < *next {
+				removedBeforeCursor++
+			}
+			continue
+		}
+		pruned = append(pruned, pr)
+	}
+	*next = max(0, *next-removedBeforeCursor)
+	return pruned
 }
 
 func (m Model) selectedPulls() []githubapi.PullRequest {
@@ -878,412 +1033,9 @@ func (m Model) selectedPulls() []githubapi.PullRequest {
 	return pulls
 }
 
-// View implements tea.Model.
-func (m Model) View() string {
-	if m.mode == modeDiffLoading {
-		return m.renderDiffLoading()
-	}
-	if m.mode == modeDiff {
-		return m.renderDiff()
-	}
-
-	var view strings.Builder
-	fmt.Fprintf(&view, "%s  %s\n", titleStyle.Render("ghpr"), helpStyle.Render("owner: "+m.owner))
-	view.WriteString(m.renderCounts())
-	view.WriteString("\n\n")
-
-	if len(m.pulls) == 0 {
-		view.WriteString("No open pull requests remain.\n")
-	} else if len(m.visible) == 0 {
-		view.WriteString(helpStyle.Render("No pull requests match the filter.") + "\n")
-	} else {
-		view.WriteString(m.renderListHeader())
-		view.WriteByte('\n')
-		start, end := m.visibleRange()
-		for index := start; index < end; index++ {
-			view.WriteString(m.renderRow(index))
-			view.WriteByte('\n')
-		}
-	}
-
-	view.WriteByte('\n')
-	switch m.mode {
-	case modeFilter:
-		view.WriteString("Filter by repository, title or author:\n")
-		view.WriteString(m.filterInput.View())
-		view.WriteByte('\n')
-		view.WriteString(helpStyle.Render("enter apply · esc cancel"))
-	case modeComment:
-		if m.pending == actionClose {
-			view.WriteString("Comment to add before closing (optional):\n")
-		} else {
-			view.WriteString("Reason for requesting changes:\n")
-		}
-		view.WriteString(m.input.View())
-		view.WriteByte('\n')
-		if m.status != "" {
-			view.WriteString(errorStyle.Render(m.status))
-			view.WriteByte('\n')
-		}
-		view.WriteString(helpStyle.Render("enter continue · esc cancel"))
-	case modeConfirm:
-		view.WriteString(m.renderConfirmation())
-	case modeRunning:
-		view.WriteString(m.renderProgress())
-	default:
-		if m.status != "" {
-			style := statusStyle
-			if strings.Contains(m.status, "failed") || strings.Contains(m.status, "required") || strings.HasPrefix(m.status, "Unable") {
-				style = errorStyle
-			}
-			view.WriteString(style.Render(m.status))
-			view.WriteByte('\n')
-		}
-		if m.stateWarning != "" {
-			view.WriteString(errorStyle.Render(clamp("CI/review data incomplete: "+m.stateWarning, m.textWidth())))
-			view.WriteByte('\n')
-		}
-		view.WriteString(helpStyle.Render("↑/↓ navigate · space select · a all · / filter · R refresh · d diff · w web · m merge · c close · r request changes · q quit"))
-		if pr, ok := m.current(); ok {
-			view.WriteByte('\n')
-			view.WriteString(helpStyle.Render(clamp(m.stateLabel(pr)+" · "+pr.URL, m.textWidth())))
-		}
-	}
-
-	return view.String()
-}
-
-func (m Model) renderCounts() string {
-	counts := fmt.Sprintf("%d open pull request(s)", len(m.pulls))
-	if m.filter != "" {
-		counts = fmt.Sprintf("%d of %d shown", len(m.visible), len(m.pulls))
-	}
-	counts += fmt.Sprintf(" · %d selected", len(m.selected))
-	if m.refreshing {
-		counts += " · " + m.spinner.View() + "refreshing"
-	}
-	if m.filter != "" && m.mode != modeFilter {
-		counts += " · " + filterStyle.Render("filter: "+m.filter)
-	}
-	return counts
-}
-
-func (m Model) renderProgress() string {
-	var view strings.Builder
-	verb := actionLabel(m.batchAction)
-	fmt.Fprintf(&view, "%s %s · %d/%d", m.spinner.View(), verb, m.batchDone, m.batchTotal)
-	if m.batchFailed > 0 {
-		view.WriteString(errorStyle.Render(fmt.Sprintf(" · %d failed", m.batchFailed)))
-	}
-	view.WriteByte('\n')
-	if m.batchCurrent != "" && m.batchDone < m.batchTotal {
-		view.WriteString(helpStyle.Render("current: " + m.batchCurrent))
-		view.WriteByte('\n')
-	}
-
-	// Show the tail of the results so long batches stay informative.
-	const recent = 4
-	start := max(0, len(m.batchResults)-recent)
-	for _, result := range m.batchResults[start:] {
-		if result.err != nil {
-			view.WriteString(errorStyle.Render(clamp("✗ "+result.pr.Key()+": "+result.err.Error(), m.textWidth())))
-		} else {
-			view.WriteString(selectedStyle.Render(clamp("✓ "+result.pr.Key()+" "+result.outcome, m.textWidth())))
-		}
-		view.WriteByte('\n')
-	}
-	view.WriteString(helpStyle.Render("ctrl+c cancel"))
-	return view.String()
-}
-
-func actionLabel(current action) string {
-	switch current {
-	case actionMerge:
-		return "Approving and merging"
-	case actionClose:
-		return "Closing"
-	case actionRequestChanges:
-		return "Requesting changes"
-	default:
-		return "Working"
-	}
-}
-
-func (m Model) renderDiffLoading() string {
-	var view strings.Builder
-	fmt.Fprintf(&view, "%s  %s\n", titleStyle.Render("ghpr diff"), m.diffPR.Key())
-	view.WriteString(truncate(m.diffPR.Title, max(20, m.width)))
-	view.WriteString("\n\n")
-	fmt.Fprintf(&view, "%s Loading diff…\n\n", m.spinner.View())
-	view.WriteString(helpStyle.Render("esc/q back · ctrl+c quit"))
-	return view.String()
-}
-
-func (m Model) renderDiff() string {
-	var view strings.Builder
-	fmt.Fprintf(&view, "%s  %s — %s\n", titleStyle.Render("ghpr diff"), m.diffPR.Key(), truncate(m.diffPR.Title, max(20, m.width-len(m.diffPR.Key())-15)))
-	view.WriteString(m.viewport.View())
-	view.WriteByte('\n')
-	progress := int(m.viewport.ScrollPercent()*100 + 0.5)
-	fmt.Fprintf(&view, "%s", helpStyle.Render(fmt.Sprintf("%3d%% · space/pgdn page down · pgup page up · ↑/↓ scroll · esc/q back", progress)))
-	return view.String()
-}
-
-// layout describes which optional columns fit in the current terminal width.
-type layout struct {
-	repository int
-	number     int
-	age        int
-	author     int
-}
-
-func (m Model) layout() layout {
-	width := m.width
-	if width <= 0 {
-		width = 100
-	}
-	columns := layout{repository: 26, number: 7}
-	if width < 80 {
-		columns.repository = 18
-	}
-	if width >= 70 {
-		columns.age = 4
-	}
-	switch {
-	case width >= 110:
-		columns.author = 16
-	case width >= 95:
-		columns.author = 12
-	}
-	return columns
-}
-
-func (m Model) renderListHeader() string {
-	columns := m.layout()
-	header := "      " + padRight("REPOSITORY", columns.repository) + " " + padRight("PR", columns.number) + " CI RV"
-	if columns.age > 0 {
-		header += " " + padRight("AGE", columns.age)
-	}
-	if columns.author > 0 {
-		header += " " + padRight("AUTHOR", columns.author)
-	}
-	header += " TITLE"
-	return helpStyle.Render(header)
-}
-
-func (m Model) renderRow(index int) string {
-	pr := m.visible[index]
-	columns := m.layout()
-
-	cursor := "  "
-	if index == m.cursor {
-		cursor = cursorStyle.Render("> ")
-	}
-	checkbox := "[ ]"
-	if m.selected[pr.Key()] {
-		checkbox = selectedStyle.Render("[x]")
-	}
-
-	repository := padRight(truncate(pr.Repository(), columns.repository), columns.repository)
-	number := padRight(fmt.Sprintf("#%d", pr.Number), columns.number)
-	prefix := fmt.Sprintf("%s%s %s %s %s %s", cursor, checkbox, repository, number, m.renderBuildGlyph(pr), m.renderReviewGlyph(pr))
-	if columns.age > 0 {
-		prefix += " " + m.renderAge(pr, columns.age)
-	}
-	if columns.author > 0 {
-		prefix += " " + padRight(authorStyle.Render(truncate(pr.Author, columns.author)), columns.author)
-	}
-
-	extra := ""
-	if pr.Draft {
-		extra = " " + draftStyle.Render("DRAFT")
-	}
-	titleWidth := 80
-	if m.width > 0 {
-		titleWidth = max(15, m.width-lipgloss.Width(prefix)-lipgloss.Width(extra)-2)
-	}
-	return fmt.Sprintf("%s %s%s", prefix, truncate(pr.Title, titleWidth), extra)
-}
-
-func (m Model) renderAge(pr githubapi.PullRequest, width int) string {
-	age := formatAge(pr.UpdatedAt, m.now())
-	style := helpStyle
-	// Anything untouched for a month is worth calling out.
-	if !pr.UpdatedAt.IsZero() && m.now().Sub(pr.UpdatedAt) > 30*24*time.Hour {
-		style = staleStyle
-	}
-	return padRight(style.Render(truncate(age, width)), width)
-}
-
-// formatAge renders a compact relative duration such as "4h" or "3w".
-func formatAge(updated, now time.Time) string {
-	if updated.IsZero() {
-		return "-"
-	}
-	elapsed := now.Sub(updated)
-	switch {
-	case elapsed < time.Minute:
-		return "now"
-	case elapsed < time.Hour:
-		return fmt.Sprintf("%dm", int(elapsed.Minutes()))
-	case elapsed < 24*time.Hour:
-		return fmt.Sprintf("%dh", int(elapsed.Hours()))
-	case elapsed < 7*24*time.Hour:
-		return fmt.Sprintf("%dd", int(elapsed.Hours()/24))
-	case elapsed < 365*24*time.Hour:
-		return fmt.Sprintf("%dw", int(elapsed.Hours()/(24*7)))
-	default:
-		return fmt.Sprintf("%dy", int(elapsed.Hours()/(24*365)))
-	}
-}
-
-func (m Model) renderBuildGlyph(pr githubapi.PullRequest) string {
-	state, loaded := m.states[pr.Key()]
-	if !loaded {
-		return padRight(helpStyle.Render("·"), 2)
-	}
-	switch state.Build {
-	case githubapi.BuildStatusSuccess:
-		return padRight(buildSuccessStyle.Render("✓"), 2)
-	case githubapi.BuildStatusPending:
-		return padRight(buildPendingStyle.Render("…"), 2)
-	case githubapi.BuildStatusFailure:
-		return padRight(buildFailureStyle.Render("✗"), 2)
-	case githubapi.BuildStatusUnknown:
-		return padRight(buildUnknownStyle.Render("?"), 2)
-	default:
-		return padRight(helpStyle.Render("–"), 2)
-	}
-}
-
-// renderReviewGlyph shows merge readiness. Conflicts win over the review
-// decision because they block the merge regardless of approvals.
-func (m Model) renderReviewGlyph(pr githubapi.PullRequest) string {
-	state, loaded := m.states[pr.Key()]
-	if !loaded {
-		return padRight(helpStyle.Render("·"), 2)
-	}
-	if state.Mergeable == githubapi.MergeableConflicting {
-		return padRight(buildFailureStyle.Render("⚠"), 2)
-	}
-	switch state.Review {
-	case githubapi.ReviewDecisionApproved:
-		return padRight(buildSuccessStyle.Render("✓"), 2)
-	case githubapi.ReviewDecisionChangesRequested:
-		return padRight(buildFailureStyle.Render("✗"), 2)
-	case githubapi.ReviewDecisionReviewRequired:
-		return padRight(buildPendingStyle.Render("○"), 2)
-	default:
-		return padRight(helpStyle.Render("–"), 2)
-	}
-}
-
-func (m Model) stateLabel(pr githubapi.PullRequest) string {
-	state, loaded := m.states[pr.Key()]
-	if !loaded {
-		return "CI: loading"
-	}
-	return state.Summary()
-}
-
-func (m Model) renderConfirmation() string {
-	verb := "approve and squash-merge"
-	if m.pending == actionClose {
-		verb = "close"
-	} else if m.pending == actionRequestChanges {
-		verb = "request changes on"
-	}
-
-	var view strings.Builder
-	fmt.Fprintf(&view, "%s %d pull request(s)?\n", strings.ToUpper(verb[:1])+verb[1:], len(m.selected))
-	if m.comment != "" {
-		fmt.Fprintf(&view, "Comment: %s\n", truncate(m.comment, max(20, m.width-10)))
-	}
-	view.WriteString(helpStyle.Render("y/enter confirm · n/esc cancel"))
-	return view.String()
-}
-
-func (m Model) visibleRange() (int, int) {
-	pageSize := m.pageSize()
-	start := 0
-	if m.cursor >= pageSize {
-		start = m.cursor - pageSize + 1
-	}
-	end := min(len(m.visible), start+pageSize)
-	return start, end
-}
-
 func (m Model) pageSize() int {
 	if m.height <= 0 {
 		return 15
 	}
 	return max(3, m.height-10)
-}
-
-// textWidth is the width available for free-form text. Before the first
-// WindowSizeMsg arrives the width is unknown, so nothing is truncated.
-func (m Model) textWidth() int {
-	if m.width <= 0 {
-		return 0
-	}
-	return max(20, m.width)
-}
-
-// clamp truncates only when a width is known; width 0 means "unbounded".
-func clamp(value string, width int) string {
-	if width <= 0 {
-		return value
-	}
-	return truncate(value, width)
-}
-
-func truncate(value string, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	runes := []rune(value)
-	if len(runes) <= width {
-		return value
-	}
-	if width == 1 {
-		return "…"
-	}
-	return string(runes[:width-1]) + "…"
-}
-
-func padRight(value string, width int) string {
-	padding := width - lipgloss.Width(value)
-	if padding <= 0 {
-		return value
-	}
-	return value + strings.Repeat(" ", padding)
-}
-
-func highlightDiff(content string) string {
-	content = strings.ReplaceAll(content, "\r\n", "\n")
-	lines := strings.Split(content, "\n")
-	for index, line := range lines {
-		switch {
-		case strings.HasPrefix(line, "diff --git "):
-			lines[index] = diffFileStyle.Render(line)
-		case strings.HasPrefix(line, "@@"):
-			lines[index] = diffHeaderStyle.Render(line)
-		case strings.HasPrefix(line, "--- "), strings.HasPrefix(line, "+++ "):
-			lines[index] = diffHeaderStyle.Render(line)
-		case strings.HasPrefix(line, "+"):
-			lines[index] = diffAddStyle.Render(line)
-		case strings.HasPrefix(line, "-"):
-			lines[index] = diffDeleteStyle.Render(line)
-		case strings.HasPrefix(line, "index "),
-			strings.HasPrefix(line, "new file mode "),
-			strings.HasPrefix(line, "deleted file mode "),
-			strings.HasPrefix(line, "similarity index "),
-			strings.HasPrefix(line, "rename from "),
-			strings.HasPrefix(line, "rename to "),
-			strings.HasPrefix(line, "Binary files "),
-			strings.HasPrefix(line, "\\ No newline at end of file"):
-			lines[index] = diffMetaStyle.Render(line)
-		}
-	}
-	return strings.Join(lines, "\n")
 }
